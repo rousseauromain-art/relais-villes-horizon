@@ -189,6 +189,16 @@ export default {
       return json({ relais: true, opensky, ais });
     }
 
+    // /osm : sonde de diagnostic vers les miroirs Overpass (villes/lieux/reperes hauts).
+    // L'appli elle-meme n'utilise PAS cette route (elle interroge Overpass directement depuis le
+    // navigateur, pour beneficier du cache/anti-429 cote client) : cette route sert uniquement a
+    // interroger les 3 miroirs de l'exterieur (sans dependre du reseau du telephone) pendant un
+    // diagnostic, ex. GET /osm?q=<requete Overpass QL encodee>&mirror=de (optionnel, sinon les 3
+    // miroirs en parallele). Retour terrain du 27/09/2026 : les 3 miroirs ont refuse la meme requete
+    // "villes" (rayon 60 km + toutes les categories de POI), 2 en delai depasse (20 s), 1 en 504
+    // apres 9 s — cette route permet de reproduire et d'isoler ce genre de panne sans aller-retour.
+    if (url.pathname === '/osm') return await osmDebug(env, url, json);
+
     // un navigateur envoie toujours Origin : les autres sites sont refuses
     if (origin && !allowed.includes(origin)) return json({ error: 'origine non autorisee : ' + origin }, 403);
 
@@ -310,6 +320,34 @@ async function checkAis(env) {
   } catch (e) {
     return 'echec (' + ((e && e.name === 'AbortError') ? `pas de reponse en ${CHECK_TIMEOUT_MS / 1000} s` : (e && e.message || e)) + ')';
   }
+}
+
+// ---------------- /osm : sonde de diagnostic vers les miroirs Overpass ----------------
+const OSM_ENDPOINTS = ['https://overpass.private.coffee/api/interpreter', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', 'https://overpass-api.de/api/interpreter'];
+const OSM_TIMEOUT_MS = 20000, OSM_MAX_Q = 4000;
+async function osmDebug(env, url, json) {
+  const q = url.searchParams.get('q');
+  if (!q || q.length > OSM_MAX_Q) return json({ error: `parametre q manquant ou trop long (max ${OSM_MAX_Q} caracteres, recu ${q ? q.length : 0})` }, 400);
+  const which = url.searchParams.get('mirror'); // fragment d'hote optionnel (ex. "de", "mail.ru") ; sinon les 3 en parallele
+  const targets = which ? OSM_ENDPOINTS.filter(e => e.includes(which)) : OSM_ENDPOINTS;
+  if (!targets.length) return json({ error: 'mirror inconnu', options: OSM_ENDPOINTS.map(e => new URL(e).hostname) }, 400);
+
+  const results = await Promise.all(targets.map(async ep => {
+    const host = new URL(ep).hostname, t0 = Date.now();
+    try {
+      const r = await fetchTimeout(ep, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'data=' + encodeURIComponent(q) }, OSM_TIMEOUT_MS);
+      const ms = Date.now() - t0;
+      if (!r.ok) return { mirror: host, ok: false, ms, error: 'HTTP ' + r.status };
+      let j; try { j = await r.json(); } catch (e) { return { mirror: host, ok: false, ms, error: 'reponse illisible (pas du JSON)' }; }
+      const elements = j.elements || [];
+      const named = elements.map(e => e.tags && (e.tags['name:fr'] || e.tags.name)).filter(Boolean);
+      return { mirror: host, ok: true, ms, elements: elements.length, named: named.length, sample: named.slice(0, 25) };
+    } catch (e) {
+      const ms = Date.now() - t0;
+      return { mirror: host, ok: false, ms, error: (e && e.name === 'AbortError') ? `delai depasse (${OSM_TIMEOUT_MS / 1000}s)` : (e && e.message || String(e)) };
+    }
+  }));
+  return json({ q, results });
 }
 
 async function planes(env, b, json) {
