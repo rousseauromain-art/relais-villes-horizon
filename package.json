@@ -1,0 +1,7 @@
+{
+  "name": "relais-villes-horizon",
+  "private": true,
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
