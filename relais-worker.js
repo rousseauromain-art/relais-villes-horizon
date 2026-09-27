@@ -323,19 +323,28 @@ async function checkAis(env) {
 }
 
 // ---------------- /osm : sonde de diagnostic vers les miroirs Overpass ----------------
+// OSM_TIMEOUT_MS volontairement bien plus court que le delai cote appli (20 s/miroir) : cette
+// route est appelee par des outils externes (ex. recuperation web automatisee) dont le delai de
+// lecture est souvent < 15-16 s. Quand un miroir reste totalement muet (ni erreur, ni reponse),
+// Promise.all attend le plus lent des 3 : mieux vaut echouer proprement en quelques secondes,
+// avec le detail de chaque miroir, que de faire "timeout" cote appelant sans aucune info (retour
+// terrain du 27/09/2026 : meme une requete minuscule restait bloquee 20 s, un miroir ne repondant
+// jamais). Reglable via ?ms=2000..15000 si besoin d'attendre un peu plus longtemps.
 const OSM_ENDPOINTS = ['https://overpass.private.coffee/api/interpreter', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', 'https://overpass-api.de/api/interpreter'];
-const OSM_TIMEOUT_MS = 20000, OSM_MAX_Q = 4000;
+const OSM_TIMEOUT_MS = 8000, OSM_MAX_Q = 4000;
 async function osmDebug(env, url, json) {
   const q = url.searchParams.get('q');
   if (!q || q.length > OSM_MAX_Q) return json({ error: `parametre q manquant ou trop long (max ${OSM_MAX_Q} caracteres, recu ${q ? q.length : 0})` }, 400);
   const which = url.searchParams.get('mirror'); // fragment d'hote optionnel (ex. "de", "mail.ru") ; sinon les 3 en parallele
+  const msParam = parseInt(url.searchParams.get('ms'), 10);
+  const timeoutMs = isFinite(msParam) ? Math.min(15000, Math.max(2000, msParam)) : OSM_TIMEOUT_MS;
   const targets = which ? OSM_ENDPOINTS.filter(e => e.includes(which)) : OSM_ENDPOINTS;
   if (!targets.length) return json({ error: 'mirror inconnu', options: OSM_ENDPOINTS.map(e => new URL(e).hostname) }, 400);
 
   const results = await Promise.all(targets.map(async ep => {
     const host = new URL(ep).hostname, t0 = Date.now();
     try {
-      const r = await fetchTimeout(ep, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'data=' + encodeURIComponent(q) }, OSM_TIMEOUT_MS);
+      const r = await fetchTimeout(ep, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'data=' + encodeURIComponent(q) }, timeoutMs);
       const ms = Date.now() - t0;
       if (!r.ok) return { mirror: host, ok: false, ms, error: 'HTTP ' + r.status };
       let j; try { j = await r.json(); } catch (e) { return { mirror: host, ok: false, ms, error: 'reponse illisible (pas du JSON)' }; }
@@ -344,10 +353,10 @@ async function osmDebug(env, url, json) {
       return { mirror: host, ok: true, ms, elements: elements.length, named: named.length, sample: named.slice(0, 25) };
     } catch (e) {
       const ms = Date.now() - t0;
-      return { mirror: host, ok: false, ms, error: (e && e.name === 'AbortError') ? `delai depasse (${OSM_TIMEOUT_MS / 1000}s)` : (e && e.message || String(e)) };
+      return { mirror: host, ok: false, ms, error: (e && e.name === 'AbortError') ? `delai depasse (${timeoutMs / 1000}s)` : (e && e.message || String(e)) };
     }
   }));
-  return json({ q, results });
+  return json({ q, timeoutMs, results });
 }
 
 async function planes(env, b, json) {
