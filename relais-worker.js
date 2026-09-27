@@ -5,6 +5,9 @@
      - AIS_KEY                : cle AISStream (bateaux)
      - OPENSKY_CLIENT_ID      : client API OpenSky (avions, OAuth2)
      - OPENSKY_CLIENT_SECRET
+     - GEOAPIFY_KEY           : cle Geoapify Places (villes/sommets/POI, source supplementaire)
+     - GEONAMES_USER          : identifiant GeoNames (pas une cle : un nom de compte, service web
+                                a activer sur la page du compte geonames.org)
    Variable (non secrete) :
      - ALLOWED_ORIGIN         : site autorise, ex. https://rousseauromain-art.github.io
 
@@ -12,6 +15,12 @@
      /health                                  -> etat du relais et des secrets
      /planes?lamin=&lomin=&lamax=&lomax=      -> avions (OpenSky, jeton gere ici)
      /ships?lamin=&lomin=&lamax=&lomax=       -> navires (ecoute AISStream ~10 s)
+     /telecom?lat=&lon=&radius_km=            -> pylones/points hauts telecom (ANFR, France uniquement)
+     /geoapify?lat=&lon=&radius_km=&kind=     -> villes/sommets/POI (Geoapify Places), source
+                                                  supplementaire en parallele d'Overpass/OpenFreeMap ;
+                                                  kind = villes|sommets|lighthouse|view|heritage|beach
+     /geonames?lat=&lon=&radius_km=&kind=     -> villes/sommets (GeoNames), autre source independante ;
+                                                  kind = villes|sommets
 
    AISStream refuse les connexions directes depuis un navigateur : le relais
    ouvre la connexion lui-meme, ecoute brievement la zone, puis renvoie un
@@ -168,6 +177,8 @@ export default {
         ok: true, relais: 'villes-horizon',
         ais: !!env.AIS_KEY,
         opensky: !!(env.OPENSKY_CLIENT_ID && env.OPENSKY_CLIENT_SECRET),
+        geoapify: !!env.GEOAPIFY_KEY,
+        geonames: !!env.GEONAMES_USER,
         origines: allowed,
       });
     }
@@ -202,6 +213,12 @@ export default {
     // un navigateur envoie toujours Origin : les autres sites sont refuses
     if (origin && !allowed.includes(origin)) return json({ error: 'origine non autorisee : ' + origin }, 403);
 
+    // /geoapify et /geonames consomment un quota nominatif (credits/jour lies au compte du relais,
+    // contrairement a ANFR/Overpass qui sont anonymes et gratuits) : places APRES le controle
+    // d'origine ci-dessus, volontairement, pour limiter leur usage au site autorise.
+    if (url.pathname === '/geoapify') return handleGeoapify(req, env, allowed);
+    if (url.pathname === '/geonames') return handleGeonames(req, env, allowed);
+
     const box = parseBox(url);
     if (!box) return json({ error: `zone invalide : lamin, lomin, lamax, lomax requis, ${MAX_SPAN}° max par cote` }, 400);
 
@@ -230,6 +247,155 @@ async function handleTelecom(req, env, allowed) {
   if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return json({ error: 'lat/lon invalides' }, 400);
   try { return await telecom(env, lat, lon, radius, json); }
   catch (e) { return json({ anfrOk: false, error: 'erreur du relais : ' + (e && e.message || e) }, 502); }
+}
+
+// ---------------- /geoapify : villes/sommets/POI supplementaires (Geoapify Places API) ----------------
+// Autre source independante d'Overpass/OpenFreeMap : Geoapify agrege plusieurs fournisseurs sur sa
+// propre infrastructure (offre gratuite : 3000 credits/jour, 1 credit = jusqu'a 20 resultats, aucune
+// carte bancaire requise). Cle GEOAPIFY_KEY, jamais exposee au navigateur. Categories Geoapify sans
+// equivalent documente pour "cape" et "rock" (les pointes/rochers du groupe POI de l'appli) : ces
+// deux groupes ne sont donc PAS couverts ici, Overpass/OpenFreeMap restent les seules sources pour eux.
+const GEOAPIFY_URL = 'https://api.geoapify.com/v2/places';
+const GEOAPIFY_GROUPS = {
+  villes: ['populated_place.city', 'populated_place.town', 'populated_place.village', 'populated_place.hamlet'],
+  sommets: ['natural.mountain.peak'],
+  lighthouse: ['man_made.lighthouse'],
+  view: ['tourism.attraction.viewpoint', 'tourism.attraction'],
+  heritage: ['heritage', 'heritage.unesco', 'tourism.sights.castle', 'tourism.sights.fort', 'tourism.sights.ruines'],
+  beach: ['beach', 'beach.beach_resort'],
+};
+// sous-categorie -> "kind" attendu cote appli (voir kindOf() dans villes-horizon.html) ; pour les
+// groupes a kind unique (sommets, lighthouse, view, heritage, beach) le kind est fixe, voir plus bas
+const GEOAPIFY_KIND_BY_CAT = {
+  'populated_place.city': 'city', 'populated_place.town': 'town',
+  'populated_place.village': 'village', 'populated_place.hamlet': 'hamlet',
+};
+const GEOAPIFY_MAX_KM = 200, GEOAPIFY_CACHE_MS = 10 * 60000;
+const geoapifyCache = new Map();
+async function handleGeoapify(req, env, allowed) {
+  const url = new URL(req.url);
+  const origin = req.headers.get('Origin') || '';
+  const cors = {
+    'Access-Control-Allow-Origin': allowed.includes(origin) ? origin : allowed[0],
+    'Access-Control-Allow-Methods': 'GET, OPTIONS', 'Access-Control-Max-Age': '86400', 'Vary': 'Origin',
+  };
+  const json = (obj, status = 200) => new Response(JSON.stringify(obj), {
+    status, headers: { ...cors, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
+  });
+  if (!env.GEOAPIFY_KEY) return json({ error: 'cle Geoapify absente du relais (secret GEOAPIFY_KEY)' }, 503);
+
+  const lat = parseFloat(url.searchParams.get('lat')), lon = parseFloat(url.searchParams.get('lon'));
+  const kind = url.searchParams.get('kind');
+  const cats = GEOAPIFY_GROUPS[kind];
+  if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return json({ error: 'lat/lon invalides' }, 400);
+  if (!cats) return json({ error: 'kind inconnu, attendu : ' + Object.keys(GEOAPIFY_GROUPS).join(', ') }, 400);
+  const radiusKm = Math.min(GEOAPIFY_MAX_KM, Math.max(0.5, parseFloat(url.searchParams.get('radius_km')) || 30));
+  const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get('limit'), 10) || 100));
+
+  const ckey = `${kind},${lat.toFixed(3)},${lon.toFixed(3)},${radiusKm},${limit}`;
+  const hit = geoapifyCache.get(ckey);
+  if (hit && Date.now() - hit.t < GEOAPIFY_CACHE_MS) return json({ ...hit.body, cache: true });
+
+  const qs = new URLSearchParams({
+    categories: cats.join(','),
+    filter: `circle:${lon},${lat},${Math.round(radiusKm * 1000)}`,
+    limit: String(limit),
+    apiKey: env.GEOAPIFY_KEY,
+  });
+  let r;
+  try { r = await fetchTimeout(GEOAPIFY_URL + '?' + qs, {}, 10000); }
+  catch (e) { return json({ error: (e && e.name === 'AbortError') ? 'Geoapify ne repond pas (10 s)' : 'Geoapify injoignable' }, 504); }
+  if (!r.ok) {
+    let msg = ''; try { msg = (await r.json()).message || ''; } catch (e) {}
+    return json({ error: 'Geoapify a repondu ' + r.status + (msg ? ' : ' + msg : '') }, 502);
+  }
+  let j; try { j = await r.json(); } catch (e) { return json({ error: 'reponse Geoapify illisible' }, 502); }
+
+  const seen = new Set(), got = [];
+  for (const f of (j.features || [])) {
+    const p = f.properties || {}; const name = p.name; if (!name) continue;
+    const lt = p.lat, ln = p.lon; if (lt == null || ln == null) continue;
+    let placeKind = null;
+    for (const c of (p.categories || [])) if (GEOAPIFY_KIND_BY_CAT[c]) { placeKind = GEOAPIFY_KIND_BY_CAT[c]; break; }
+    const resolvedKind = placeKind || (kind === 'sommets' ? 'peak' : kind);
+    const key = name + '@' + lt.toFixed(4) + ',' + ln.toFixed(4);
+    if (seen.has(key)) continue; seen.add(key);
+    // Geoapify Places ne fournit pas d'altitude dans les champs standard : ele reste null (la fusion
+    // cote appli la complete depuis une autre source si elle la connait, cf. mergeByNameProximity)
+    got.push({ name, lat: lt, lon: ln, kind: resolvedKind, pop: +(p.population || 0), ele: (typeof p.elevation === 'number') ? p.elevation : null });
+  }
+  const body = { places: got };
+  geoapifyCache.set(ckey, { t: Date.now(), body });
+  if (geoapifyCache.size > 300) geoapifyCache.delete(geoapifyCache.keys().next().value);
+  return json(body);
+}
+
+// ---------------- /geonames : villes/sommets, autre source independante (GeoNames) ----------------
+// Necessite un compte GRATUIT sur geonames.org avec le service web active (page du compte, case
+// "Enable"), distinct d'une simple cle API : GEONAMES_USER est cet identifiant de compte, jamais
+// expose au navigateur. Cout en "credits" (quota par defaut du compte gratuit, non verifie ici) :
+// findNearbyPlaceNameJSON = 3 credits/appel, findNearbyJSON = 4/appel.
+const GEONAMES_BASE = 'https://secure.geonames.org';
+const GEONAMES_MAX_KM = 200, GEONAMES_CACHE_MS = 10 * 60000;
+const geonamesCache = new Map();
+// GeoNames ne classe pas ses lieux avec la meme finesse que le tag OSM "place" (city/town/village/
+// hamlet) : seuil approximatif par population, uniquement pour choisir un rang d'affichage cote appli
+function geonamesKindFromPop(pop) {
+  if (pop >= 100000) return 'city';
+  if (pop >= 10000) return 'town';
+  if (pop >= 1000) return 'village';
+  return 'hamlet';
+}
+async function handleGeonames(req, env, allowed) {
+  const url = new URL(req.url);
+  const origin = req.headers.get('Origin') || '';
+  const cors = {
+    'Access-Control-Allow-Origin': allowed.includes(origin) ? origin : allowed[0],
+    'Access-Control-Allow-Methods': 'GET, OPTIONS', 'Access-Control-Max-Age': '86400', 'Vary': 'Origin',
+  };
+  const json = (obj, status = 200) => new Response(JSON.stringify(obj), {
+    status, headers: { ...cors, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
+  });
+  if (!env.GEONAMES_USER) return json({ error: 'identifiant GeoNames absent du relais (secret GEONAMES_USER)' }, 503);
+
+  const lat = parseFloat(url.searchParams.get('lat')), lon = parseFloat(url.searchParams.get('lon'));
+  const kind = url.searchParams.get('kind');
+  if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return json({ error: 'lat/lon invalides' }, 400);
+  if (kind !== 'villes' && kind !== 'sommets') return json({ error: 'kind inconnu, attendu : villes, sommets' }, 400);
+  const radiusKm = Math.min(GEONAMES_MAX_KM, Math.max(1, parseFloat(url.searchParams.get('radius_km')) || 30));
+  const maxRows = Math.min(100, Math.max(1, parseInt(url.searchParams.get('max'), 10) || 30));
+
+  const ckey = `${kind},${lat.toFixed(3)},${lon.toFixed(3)},${radiusKm},${maxRows}`;
+  const hit = geonamesCache.get(ckey);
+  if (hit && Date.now() - hit.t < GEONAMES_CACHE_MS) return json({ ...hit.body, cache: true });
+
+  const qs = new URLSearchParams({ lat: String(lat), lng: String(lon), radius: String(radiusKm), maxRows: String(maxRows), style: 'FULL', username: env.GEONAMES_USER });
+  let endpoint;
+  if (kind === 'villes') endpoint = GEONAMES_BASE + '/findNearbyPlaceNameJSON?' + qs;
+  else { qs.append('featureClass', 'T'); qs.append('featureCode', 'PK'); qs.append('featureCode', 'MT'); endpoint = GEONAMES_BASE + '/findNearbyJSON?' + qs; }
+
+  let r;
+  try { r = await fetchTimeout(endpoint, {}, 10000); }
+  catch (e) { return json({ error: (e && e.name === 'AbortError') ? 'GeoNames ne repond pas (10 s)' : 'GeoNames injoignable' }, 504); }
+  if (!r.ok) return json({ error: 'GeoNames a repondu ' + r.status }, 502);
+  let j; try { j = await r.json(); } catch (e) { return json({ error: 'reponse GeoNames illisible' }, 502); }
+  if (j.status) return json({ error: 'GeoNames : ' + (j.status.message || 'erreur inconnue') }, 502);
+
+  const seen = new Set(), got = [];
+  for (const g of (j.geonames || [])) {
+    const name = g.name || g.toponymName; if (!name) continue;
+    const lt = parseFloat(g.lat), ln = parseFloat(g.lng); if (!isFinite(lt) || !isFinite(ln)) continue;
+    const key = name + '@' + lt.toFixed(4) + ',' + ln.toFixed(4);
+    if (seen.has(key)) continue; seen.add(key);
+    const pop = +(g.population || 0);
+    const rawEle = g.elevation != null ? g.elevation : (g.srtm3 != null ? g.srtm3 : g.astergdem);
+    const ele = (typeof rawEle === 'number' && rawEle > -1000) ? rawEle : null; // -32768 = "sans donnee" (sentinelle SRTM)
+    got.push({ name, lat: lt, lon: ln, kind: kind === 'sommets' ? 'peak' : geonamesKindFromPop(pop), pop, ele });
+  }
+  const body = { places: got };
+  geonamesCache.set(ckey, { t: Date.now(), body });
+  if (geonamesCache.size > 300) geonamesCache.delete(geonamesCache.keys().next().value);
+  return json(body);
 }
 
 function parseBox(url) {
