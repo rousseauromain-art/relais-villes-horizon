@@ -1,5 +1,5 @@
 /* =====================================================================
-   Relais « Villes a l'horizon  » — Cloudflare Worker (offre gratuite)
+   Relais « Villes a l'horizon » — Cloudflare Worker (offre gratuite)
    ---------------------------------------------------------------------
    Detient les secrets cote serveur, jamais dans le navigateur :
      - AIS_KEY                : cle AISStream (bateaux)
