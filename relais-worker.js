@@ -59,11 +59,11 @@ const NAT_URL = 'https://data.anfr.fr/sites/default/files/dataset/dd1/1fac6-4531
 const TELECOM_MAX_KM = 15, TELECOM_MAX_COMMUNES = 12, TELECOM_CACHE_MS = 5 * 60000;
 const ANFR_ROWS = 5000;          // lignes max par requete (une ligne = un operateur x un systeme radio)
 const ANFR_TIMEOUT_MS = 12000;
-const ANFR_WINNER_MS = 3600000;  // on reessaie d'abord la route gagnante pendant 1 h
+const ANFR_FAIL_MS = 15 * 60000; // une route en echec passe en fin de liste pendant 15 min
 const PLM = new Set(['75056', '69123', '13055']); // Paris, Lyon, Marseille : codes "commune" jamais utilises par ANFR
 const ANFR_FIELDS = 'sup_id,adm_lb_nom,emr_lb_systeme,generation,statut,emr_dt,sta_nm_anfr,nat_id,sup_nm_haut,tpo_id,adr_lb_lieu,adr_lb_add1,adr_lb_add2,adr_lb_add3,adr_nm_cp,code_insee,coordonnees,coord';
 let tpoMap = null, natMap = null, lookupsAt = 0, lookupsErr = null;
-let anfrWinner = null, anfrWinnerAt = 0;
+const anfrFailedAt = new Map(); // route -> instant du dernier echec
 const telecomCache = new Map();
 
 async function fetchTO(url, ms) {
@@ -182,7 +182,7 @@ async function runStrategy(s, ctx) {
   const t0 = Date.now(), att = { strategy: s.id, label: s.label, calls: [] };
   if (s.communes && !ctx.communes.length) { att.ok = false; att.error = 'aucune commune trouvee'; return { att }; }
   const urls = s.urls(ctx);
-  const results = await Promise.all(urls.map(async u => {
+  const one = async u => {
     const call = { url: u };
     try {
       const r = await fetchTO(u, ANFR_TIMEOUT_MS);
@@ -198,7 +198,14 @@ async function runStrategy(s, ctx) {
       call.error = e && e.name === 'AbortError' ? 'delai depasse' : String(e && e.message || e);
       return { ok: false, call };
     }
-  }));
+  };
+  // Cloudflare (offre gratuite) : 50 sous-requetes max par appel. Une route "par commune" est donc
+  // d'abord sondee sur UNE commune ; les autres ne sont lancees que si elle repond. Une route morte
+  // ne coute ainsi qu'1 requete au lieu de 12. En mode comparaison (probeOnly), on s'arrete a la sonde.
+  const first = await one(urls[0]);
+  let results = [first];
+  if (first.ok && urls.length > 1 && !ctx.probeOnly) results = results.concat(await Promise.all(urls.slice(1).map(one)));
+  if (ctx.probeOnly && urls.length > 1) att.probe = `sondee sur 1 commune sur ${urls.length}`;
   att.calls = results.map(x => x.call); att.ms = Date.now() - t0;
   const good = results.filter(x => x.ok);
   // echec si la moindre requete tombe en 404 / refus (route cassee), ou si rien n'a marche
@@ -248,39 +255,70 @@ async function telecom(env, lat, lon, radiusKm, json, debug) {
   const hit = telecomCache.get(ckey);
   if (!debug && hit && Date.now() - hit.t < TELECOM_CACHE_MS) return json({ ...hit.body, cache: true });
 
-  const tc = Date.now();
-  const communesAll = await communesInRadius(lat, lon, radiusKm);
-  const communesMs = Date.now() - tc;
-  if (!communesAll.length) {
-    const body = { anfrOk: true, hors_france: true, sites: [], communes: [] };
-    telecomCache.set(ckey, { t: Date.now(), body });
-    return json(debug ? { ...body, debug: { communesMs, note: 'geo.api.gouv.fr : aucune commune (hors de France, ou service en panne)' } } : body);
-  }
-  const communes = communesAll.slice(0, TELECOM_MAX_COMMUNES);
   await ensureLookups();
-  const ctx = { lat, lon, radiusKm, communes };
+  // communes : calculees seulement si une route "par commune" en a besoin (la route par rayon s'en
+  // passe : 9 a 18 appels a geo.api.gouv.fr economises quand elle marche, ce qui est le cas depuis le 28/09)
+  let communesAll = null, communesMs = 0;
+  const getCommunes = async () => {
+    if (communesAll) return communesAll;
+    const tc = Date.now(); communesAll = await communesInRadius(lat, lon, radiusKm); communesMs = Date.now() - tc;
+    return communesAll;
+  };
+  const ctx = { lat, lon, radiusKm, communes: [] };
 
-  // ordre : route gagnante recente d'abord, puis les autres dans l'ordre de preference
-  let order = ANFR_STRATEGIES.slice();
-  if (anfrWinner && Date.now() - anfrWinnerAt < ANFR_WINNER_MS && debug !== 'all') {
-    order = [order.find(s => s.id === anfrWinner), ...order.filter(s => s.id !== anfrWinner)].filter(Boolean);
-  }
-  const attempts = []; let rows = null, used = null;
+  // ordre de preference conserve (la route par rayon d'abord : 1 requete) ; les routes en echec
+  // recent passent en fin de liste, pour ne pas gaspiller de requetes sur une route connue morte
+  const recentFail = s => debug !== 'all' && Date.now() - (anfrFailedAt.get(s.id) || 0) < ANFR_FAIL_MS;
+  const order = ANFR_STRATEGIES.filter(s => !recentFail(s)).concat(ANFR_STRATEGIES.filter(recentFail));
+  const attempts = []; let rows = null, used = null, radiusEff = radiusKm;
   for (const s of order) {
-    const { att, rows: got } = await runStrategy(s, ctx);
+    ctx.radiusKm = radiusKm;
+    if (s.communes && !ctx.communes.length) {
+      ctx.communes = (await getCommunes()).slice(0, TELECOM_MAX_COMMUNES);
+      if (!ctx.communes.length && !communesAll.length && !rows) {
+        const body = { anfrOk: true, hors_france: true, sites: [], communes: [] };
+        telecomCache.set(ckey, { t: Date.now(), body });
+        return json(debug ? { ...body, debug: { communesMs, attempts, note: 'geo.api.gouv.fr : aucune commune (hors de France, ou service en panne)' } } : body);
+      }
+    }
+    let { att, rows: got } = await runStrategy(s, ctx);
+    // Zone dense (ex. Montrouge : 19 657 lignes dans 8 km pour 5 000 recues) : ANFR renvoie les lignes
+    // SANS ordre de distance, donc une liste tronquee = des pylones manquants au hasard, proches compris.
+    // On resserre plutot le rayon jusqu'a tout recevoir : on voit TOUS les supports proches (les seuls
+    // reellement visibles en ville), plutot qu'un echantillon aleatoire sur 8 km.
+    for (let k = 0; k < 3 && s.id === 'search-geofilter' && att.ok && att.total > att.rows; k++) {
+      const before = att; before.note = 'liste tronquee : rayon resserre';
+      attempts.push(before);
+      ctx.radiusKm = Math.max(0.5, Math.round(ctx.radiusKm * Math.sqrt(att.rows / att.total) * 0.9 * 10) / 10);
+      ({ att, rows: got } = await runStrategy(s, ctx));
+      att.radiusKm = ctx.radiusKm;
+    }
     attempts.push(att);
-    if (att.ok && !rows) { rows = got; used = s; if (debug !== 'all') break; }
+    if (att.ok) anfrFailedAt.delete(s.id); else anfrFailedAt.set(s.id, Date.now());
+    if (att.ok && !rows) { rows = got; used = s; radiusEff = ctx.radiusKm; if (debug !== 'all') break; ctx.probeOnly = true; }
   }
-  const dbg = debug ? { communes: communesAll, communesMs, lookups: lookupsErr || 'ok', attempts } : undefined;
+  ctx.radiusKm = radiusKm;
+  const dbg = debug ? { communes: communesAll || 'non utilisees (route par rayon)', communesMs, lookups: lookupsErr || 'ok', attempts } : undefined;
   if (!rows) {
-    anfrWinner = null;
     const resume = attempts.map(a => `${a.strategy} : ${a.error}`).join(' | ');
     return json({ anfrOk: false, error: 'toutes les routes ANFR ont echoue — ' + resume, debug: dbg }, 502);
   }
-  anfrWinner = used.id; anfrWinnerAt = Date.now();
-  const { sites, noCoord } = groupSites(rows, lat, lon, radiusKm);
-  const winAtt = attempts.find(a => a.strategy === used.id);
-  const body = { anfrOk: true, sites, communes, route: used.id,
+  const { sites, noCoord } = groupSites(rows, lat, lon, radiusEff);
+  // 0 ligne par la route rayon : campagne francaise vide... ou hors de France (1 seul appel pour trancher)
+  if (!sites.length && used.id === 'search-geofilter') {
+    try {
+      const r = await fetchTO(`${GEO_BASE}?lat=${lat.toFixed(5)}&lon=${lon.toFixed(5)}&fields=code&format=json`, 6000);
+      const j = r.ok ? await r.json() : null;
+      if (Array.isArray(j) && !j.length) {
+        const body = { anfrOk: true, hors_france: true, sites: [], communes: [] };
+        telecomCache.set(ckey, { t: Date.now(), body });
+        return json(debug ? { ...body, debug: dbg } : body);
+      }
+    } catch (e) {}
+  }
+  const winAtt = attempts.filter(a => a.strategy === used.id && a.ok).pop();
+  const body = { anfrOk: true, sites, communes: ctx.communes, route: used.id,
+    radius_km: radiusKm, radius_eff: radiusEff < radiusKm ? radiusEff : undefined,
     truncated: !!(winAtt && winAtt.calls.some(c => c.truncated)), noCoord: noCoord || undefined };
   telecomCache.set(ckey, { t: Date.now(), body });
   if (telecomCache.size > 200) telecomCache.delete(telecomCache.keys().next().value);
