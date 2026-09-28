@@ -16,6 +16,8 @@
      /planes?lamin=&lomin=&lamax=&lomax=      -> avions (OpenSky, jeton gere ici)
      /ships?lamin=&lomin=&lamax=&lomax=       -> navires (ecoute AISStream ~10 s)
      /telecom?lat=&lon=&radius_km=            -> pylones/points hauts telecom (ANFR, France uniquement)
+              [&debug=1|all]                     debug=1 : detail de chaque route ANFR essayee ;
+                                                  debug=all : les essaie TOUTES (comparaison)
      /geoapify?lat=&lon=&radius_km=&kind=     -> villes/sommets/POI (Geoapify Places), source
                                                   supplementaire en parallele d'Overpass/OpenFreeMap ;
                                                   kind = villes|sommets|lighthouse|view|heritage|beach
@@ -38,22 +40,39 @@ const PLANE_CACHE_MS = 10000;
 const SHIP_TTL_MS = 20 * 60000;
 
 // ---------------- pylones et points hauts telecom (France uniquement, source ANFR) ----------------
-// ANFR ne propose pas de recherche par rayon geographique : on resout les communes couvertes par
-// le rayon demande via l'API officielle "decoupage administratif" (geo.api.gouv.fr), puis on
-// interroge ANFR filtre sur ces communes (refine.code_insee, seul filtre geographique documente
-// qui fonctionne reellement aupres d'ANFR). Resultat regroupe par support (un pylone = plusieurs
-// lignes, une par operateur x systeme radio).
+// Constat du 28/09/2026 (tests manuels) : l'ancienne route "records/2.0/resource" repond 404 ; le jeu
+// de donnees existe toujours (meme UUID de ressource, CSV du 24/09/2026). data.anfr.fr est un portail
+// "d4c" : facade facon OpenDataSoft (records/1.0/search) posee sur un CKAN (records/1.0/download =
+// datastore_search). Deux routes repondent : search v1 (par nom de jeu) et download (par UUID).
+// Comme ANFR change parfois ses routes sans prevenir, le relais essaie plusieurs strategies dans
+// l'ordre, garde en memoire celle qui a marche, et sait tout detailler (?debug=1 ou ?debug=all).
+// Autres pieges constates :
+//  - les lignes n'ont plus de "geometry" : coordonnees dans un texte "48.10 , -1.70" (ou DMS) ;
+//  - un seul refine.code_insee est pris en compte par requete (les suivants sont ignores) ;
+//  - Paris/Lyon/Marseille : ANFR range par ARRONDISSEMENT (75108...), jamais sous 75056 -> 0 resultat.
 const ANFR_RESOURCE = '88ef0887-6b0f-4d3f-8545-6d64c8f597da';
-const ANFR_BASE = 'https://data.anfr.fr/d4c/api/records/2.0/resource/';
+const ANFR_DATASET = 'observatoire_2g_3g_4g';
+const ANFR_API = 'https://data.anfr.fr/d4c/api/records/';
 const GEO_BASE = 'https://geo.api.gouv.fr/communes';
 const TPO_URL = 'https://data.anfr.fr/sites/default/files/dataset/dd1/1fac6-4531-4a27-9c8c-a3a9e4ec2107/sup_proprietaire_0.txt';
 const NAT_URL = 'https://data.anfr.fr/sites/default/files/dataset/dd1/1fac6-4531-4a27-9c8c-a3a9e4ec2107/sup_nature_0.txt';
 const TELECOM_MAX_KM = 15, TELECOM_MAX_COMMUNES = 12, TELECOM_CACHE_MS = 5 * 60000;
-let tpoMap = null, natMap = null, lookupsAt = 0;
+const ANFR_ROWS = 5000;          // lignes max par requete (une ligne = un operateur x un systeme radio)
+const ANFR_TIMEOUT_MS = 12000;
+const ANFR_WINNER_MS = 3600000;  // on reessaie d'abord la route gagnante pendant 1 h
+const PLM = new Set(['75056', '69123', '13055']); // Paris, Lyon, Marseille : codes "commune" jamais utilises par ANFR
+const ANFR_FIELDS = 'sup_id,adm_lb_nom,emr_lb_systeme,generation,statut,emr_dt,sta_nm_anfr,nat_id,sup_nm_haut,tpo_id,adr_lb_lieu,adr_lb_add1,adr_lb_add2,adr_lb_add3,adr_nm_cp,code_insee,coordonnees,coord';
+let tpoMap = null, natMap = null, lookupsAt = 0, lookupsErr = null;
+let anfrWinner = null, anfrWinnerAt = 0;
 const telecomCache = new Map();
 
+async function fetchTO(url, ms) {
+  const ctrl = new AbortController(); const id = setTimeout(() => ctrl.abort(), ms);
+  try { return await fetch(url, { signal: ctrl.signal, headers: { 'Accept': 'application/json' } }); }
+  finally { clearTimeout(id); }
+}
 async function loadLookup(url) {
-  const r = await fetch(url);
+  const r = await fetchTO(url, 8000);
   if (!r.ok) throw new Error('lookup HTTP ' + r.status);
   const txt = await r.text(), map = new Map();
   txt.trim().split('\n').slice(1).forEach(line => {
@@ -62,10 +81,13 @@ async function loadLookup(url) {
   });
   return map;
 }
+// tables proprietaire/nature : utiles mais pas indispensables (sans elles on garde les sites, sans libelle)
 async function ensureLookups() {
   if (tpoMap && natMap && Date.now() - lookupsAt < 24 * 3600000) return;
-  const [tpo, nat] = await Promise.all([loadLookup(TPO_URL), loadLookup(NAT_URL)]);
-  tpoMap = tpo; natMap = nat; lookupsAt = Date.now();
+  try {
+    const [tpo, nat] = await Promise.all([loadLookup(TPO_URL), loadLookup(NAT_URL)]);
+    tpoMap = tpo; natMap = nat; lookupsAt = Date.now(); lookupsErr = null;
+  } catch (e) { lookupsErr = String(e && e.message || e); tpoMap = tpoMap || new Map(); natMap = natMap || new Map(); }
 }
 function haversineKm(la1, lo1, la2, lo2) {
   const R = 6371, D = Math.PI / 180;
@@ -81,45 +103,122 @@ async function communesInRadius(lat, lon, radiusKm) {
   }
   const codes = new Set();
   await Promise.all(pts.map(async ([la, lo]) => {
+    const base = `${GEO_BASE}?lat=${la.toFixed(5)}&lon=${lo.toFixed(5)}&fields=code&format=json`;
     try {
-      const r = await fetch(`${GEO_BASE}?lat=${la.toFixed(5)}&lon=${lo.toFixed(5)}&fields=code&format=json`);
+      const r = await fetchTO(base, 6000);
       if (!r.ok) return;
       const j = await r.json();
-      if (Array.isArray(j)) for (const c of j) if (c.code) codes.add(c.code);
+      if (!Array.isArray(j)) return;
+      for (const c of j) {
+        if (!c.code) continue;
+        if (!PLM.has(c.code)) { codes.add(c.code); continue; }
+        // Paris/Lyon/Marseille : on demande l'arrondissement de ce point, seul code connu d'ANFR
+        try {
+          const r2 = await fetchTO(base + '&type=arrondissement-municipal', 6000);
+          const j2 = r2.ok ? await r2.json() : [];
+          if (Array.isArray(j2)) for (const a2 of j2) if (a2.code) codes.add(a2.code);
+        } catch (e) {}
+      }
     } catch (e) {}
   }));
   return [...codes];
 }
-async function telecom(env, lat, lon, radiusKm, json) {
-  radiusKm = Math.min(TELECOM_MAX_KM, Math.max(0.5, radiusKm || 5));
-  const ckey = `${lat.toFixed(3)},${lon.toFixed(3)},${radiusKm}`;
-  const hit = telecomCache.get(ckey);
-  if (hit && Date.now() - hit.t < TELECOM_CACHE_MS) return json({ ...hit.body, cache: true });
 
-  const communes = await communesInRadius(lat, lon, radiusKm);
-  if (!communes.length) {
-    const body = { anfrOk: true, hors_france: true, sites: [], communes: [] };
-    telecomCache.set(ckey, { t: Date.now(), body });
-    return json(body);
+// coordonnees : geometry GeoJSON, geo_point [lat,lon], texte "lat , lon" ou DMS "48°6'2''N 1°42'16''W"
+function parseDMS(s) {
+  const m = /(\d+)°\s*(\d+)'\s*([\d.]+)(?:''|")\s*([NS])\s+(\d+)°\s*(\d+)'\s*([\d.]+)(?:''|")\s*([EW])/i.exec(s);
+  if (!m) return null;
+  const v = (d, mi, se, h) => (+d + mi / 60 + se / 3600) * (/[SW]/i.test(h) ? -1 : 1);
+  return [v(m[1], m[2], m[3], m[4]), v(m[5], m[6], m[7], m[8])];
+}
+function coordsOf(f, r) {
+  const g = r && r.geometry && r.geometry.coordinates;
+  if (Array.isArray(g) && g.length >= 2 && isFinite(g[0]) && isFinite(g[1])) return [+g[1], +g[0]];
+  for (const k of ['geo_point_2d', 'coord', 'coordonnees']) {
+    const v = f[k];
+    if (Array.isArray(v) && v.length === 2 && isFinite(v[0]) && isFinite(v[1])) return [+v[0], +v[1]];
+    if (v && typeof v === 'object' && isFinite(v.lat) && isFinite(v.lon)) return [+v.lat, +v.lon];
   }
-  const used = communes.slice(0, TELECOM_MAX_COMMUNES);
-  await ensureLookups();
+  if (typeof f.coordonnees === 'string') {
+    const p = f.coordonnees.split(/\s*[,;]\s*/).map(x => parseFloat(x));
+    if (p.length === 2 && isFinite(p[0]) && isFinite(p[1]) && Math.abs(p[0]) <= 90) return p;
+  }
+  if (typeof f.coord === 'string') return parseDMS(f.coord);
+  return null;
+}
+// les 3 formats de reponse rencontres : tableau (ancienne 2.0), OpenDataSoft v1 (records/nhits),
+// CKAN datastore (success/result.records/result.total). HTTP 200 + "status":"error" = echec.
+function extractRows(j) {
+  if (Array.isArray(j)) return { rows: j.map(r => ({ f: r.fields || r, r })), total: j.length };
+  if (!j || typeof j !== 'object') throw new Error('reponse vide');
+  if (j.success === false) throw new Error('refus CKAN : ' + JSON.stringify(j.error || {}).slice(0, 160));
+  if (j.status === 'error') throw new Error('requete refusee par ANFR ("status":"error")');
+  if (j.result && Array.isArray(j.result.records)) return { rows: j.result.records.map(r => ({ f: r, r })), total: +j.result.total || j.result.records.length };
+  if (Array.isArray(j.records)) return { rows: j.records.map(r => ({ f: r.fields || r, r })), total: isFinite(j.nhits) ? +j.nhits : j.records.length };
+  throw new Error('format de reponse inattendu (' + Object.keys(j).slice(0, 5).join(',') + ')');
+}
 
-  const qs = new URLSearchParams({ format: 'json', resource_id: ANFR_RESOURCE });
-  for (const c of used) qs.append('refine.code_insee', c);
-  const r = await fetch(ANFR_BASE + '?' + qs.toString());
-  if (!r.ok) return json({ anfrOk: false, error: 'ANFR a repondu ' + r.status + ' (leur systeme de donnees connait parfois des pannes)' }, 502);
-  let rows;
-  try { rows = await r.json(); } catch (e) { return json({ anfrOk: false, error: 'reponse ANFR illisible' }, 502); }
-  if (!Array.isArray(rows)) return json({ anfrOk: false, error: 'format ANFR inattendu' }, 502);
+// Strategies, de la plus economique a la plus lourde. "urls" recoit le contexte et renvoie la liste
+// des URL a interroger (une seule, ou une par commune). Les virgules et deux-points restent en clair
+// dans geofilter (autorises dans une query string ; certains serveurs ne les re-decodent pas).
+const enc = encodeURIComponent;
+const ANFR_STRATEGIES = [
+  { id: 'search-geofilter', label: 'Search v1 + filtre par rayon (1 requete, sans communes)', communes: false,
+    urls: c => [`${ANFR_API}1.0/search/?dataset=${ANFR_DATASET}&rows=${ANFR_ROWS}&geofilter.distance=${c.lat.toFixed(5)},${c.lon.toFixed(5)},${Math.round(c.radiusKm * 1000)}`],
+    // si ANFR ignore le filtre, il renvoie toute la France (~830 000 lignes) : c'est un echec deguise
+    sane: (tot) => tot < 200000 },
+  { id: 'download-filters', label: 'Download (CKAN) + filtre JSON multi-communes (1 requete)', communes: true,
+    urls: c => [`${ANFR_API}1.0/download/?resource_id=${ANFR_RESOURCE}&limit=${ANFR_ROWS * 3}&fields=${ANFR_FIELDS}&filters=${enc(JSON.stringify({ code_insee: c.communes }))}`],
+    sane: (tot, c, rows) => rows.every(x => !x.f.code_insee || c.communes.includes(String(x.f.code_insee))) },
+  { id: 'download-refine', label: 'Download (CKAN) par commune', communes: true,
+    urls: c => c.communes.map(k => `${ANFR_API}1.0/download/?resource_id=${ANFR_RESOURCE}&limit=${ANFR_ROWS}&fields=${ANFR_FIELDS}&refine.code_insee=${enc(k)}`) },
+  { id: 'search-refine', label: 'Search v1 par commune', communes: true,
+    urls: c => c.communes.map(k => `${ANFR_API}1.0/search/?dataset=${ANFR_DATASET}&rows=${ANFR_ROWS}&refine.code_insee=${enc(k)}`) },
+  { id: 'legacy-resource', label: 'Ancienne route records/2.0/resource (morte le 28/09/2026)', communes: true,
+    urls: c => c.communes.map(k => `${ANFR_API}2.0/resource/?format=json&resource_id=${ANFR_RESOURCE}&refine.code_insee=${enc(k)}`) },
+];
 
-  const bySup = new Map();
-  for (const row of rows) {
-    const f = row.fields; if (!f || !f.sup_id) continue;
-    const coords = row.geometry && row.geometry.coordinates; if (!coords) continue;
-    const [slon, slat] = coords;
-    const dist = haversineKm(lat, lon, slat, slon);
-    if (dist > radiusKm) continue;
+async function runStrategy(s, ctx) {
+  const t0 = Date.now(), att = { strategy: s.id, label: s.label, calls: [] };
+  if (s.communes && !ctx.communes.length) { att.ok = false; att.error = 'aucune commune trouvee'; return { att }; }
+  const urls = s.urls(ctx);
+  const results = await Promise.all(urls.map(async u => {
+    const call = { url: u };
+    try {
+      const r = await fetchTO(u, ANFR_TIMEOUT_MS);
+      call.http = r.status;
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const txt = await r.text(); call.bytes = txt.length;
+      let j; try { j = JSON.parse(txt); } catch (e) { throw new Error('pas du JSON (' + txt.slice(0, 60).replace(/\s+/g, ' ') + ')'); }
+      const out = extractRows(j);
+      call.rows = out.rows.length; call.total = out.total;
+      if (out.total > out.rows.length) call.truncated = true;
+      return { ok: true, out, call };
+    } catch (e) {
+      call.error = e && e.name === 'AbortError' ? 'delai depasse' : String(e && e.message || e);
+      return { ok: false, call };
+    }
+  }));
+  att.calls = results.map(x => x.call); att.ms = Date.now() - t0;
+  const good = results.filter(x => x.ok);
+  // echec si la moindre requete tombe en 404 / refus (route cassee), ou si rien n'a marche
+  const broken = results.find(x => !x.ok && (/HTTP 4\d\d|refus|status|format|JSON/.test(x.call.error)));
+  if (!good.length || broken) { att.ok = false; att.error = (broken || results[0]).call.error; return { att }; }
+  const rows = good.flatMap(x => x.out.rows);
+  const total = good.reduce((a, x) => a + (x.out.total || 0), 0);
+  if (s.sane && !s.sane(total, ctx, rows)) { att.ok = false; att.error = `filtre ignore par ANFR (${total} lignes pour toute la zone)`; return { att }; }
+  att.ok = true; att.rows = rows.length; att.total = total;
+  if (good.length < results.length) att.partial = `${results.length - good.length} requete(s) sur ${results.length} en echec`;
+  return { att, rows };
+}
+
+function groupSites(rows, lat, lon, radiusKm) {
+  const bySup = new Map(); let noCoord = 0;
+  for (const { f, r } of rows) {
+    if (!f || !f.sup_id) continue;
+    const ll = coordsOf(f, r); if (!ll) { noCoord++; continue; }
+    const [slat, slon] = ll;
+    if (haversineKm(lat, lon, slat, slon) > radiusKm) continue;
     let s = bySup.get(f.sup_id);
     if (!s) {
       s = {
@@ -139,11 +238,53 @@ async function telecom(env, lat, lon, radiusKm, json) {
     if (!op) { op = { name: f.adm_lb_nom, systems: [] }; s.operators.set(f.adm_lb_nom, op); }
     op.systems.push({ system: f.emr_lb_systeme, generation: f.generation, status: f.statut, date: f.emr_dt });
   }
-  const sites = [...bySup.values()].map(s => ({ ...s, operators: [...s.operators.values()] }));
-  const body = { anfrOk: true, sites, communes: used };
+  return { sites: [...bySup.values()].map(s => ({ ...s, operators: [...s.operators.values()] })), noCoord };
+}
+
+// debug : '' (normal), '1' (detail des tentatives), 'all' (essaie TOUTES les strategies, pour comparer)
+async function telecom(env, lat, lon, radiusKm, json, debug) {
+  radiusKm = Math.min(TELECOM_MAX_KM, Math.max(0.5, radiusKm || 5));
+  const ckey = `${lat.toFixed(3)},${lon.toFixed(3)},${radiusKm}`;
+  const hit = telecomCache.get(ckey);
+  if (!debug && hit && Date.now() - hit.t < TELECOM_CACHE_MS) return json({ ...hit.body, cache: true });
+
+  const tc = Date.now();
+  const communesAll = await communesInRadius(lat, lon, radiusKm);
+  const communesMs = Date.now() - tc;
+  if (!communesAll.length) {
+    const body = { anfrOk: true, hors_france: true, sites: [], communes: [] };
+    telecomCache.set(ckey, { t: Date.now(), body });
+    return json(debug ? { ...body, debug: { communesMs, note: 'geo.api.gouv.fr : aucune commune (hors de France, ou service en panne)' } } : body);
+  }
+  const communes = communesAll.slice(0, TELECOM_MAX_COMMUNES);
+  await ensureLookups();
+  const ctx = { lat, lon, radiusKm, communes };
+
+  // ordre : route gagnante recente d'abord, puis les autres dans l'ordre de preference
+  let order = ANFR_STRATEGIES.slice();
+  if (anfrWinner && Date.now() - anfrWinnerAt < ANFR_WINNER_MS && debug !== 'all') {
+    order = [order.find(s => s.id === anfrWinner), ...order.filter(s => s.id !== anfrWinner)].filter(Boolean);
+  }
+  const attempts = []; let rows = null, used = null;
+  for (const s of order) {
+    const { att, rows: got } = await runStrategy(s, ctx);
+    attempts.push(att);
+    if (att.ok && !rows) { rows = got; used = s; if (debug !== 'all') break; }
+  }
+  const dbg = debug ? { communes: communesAll, communesMs, lookups: lookupsErr || 'ok', attempts } : undefined;
+  if (!rows) {
+    anfrWinner = null;
+    const resume = attempts.map(a => `${a.strategy} : ${a.error}`).join(' | ');
+    return json({ anfrOk: false, error: 'toutes les routes ANFR ont echoue — ' + resume, debug: dbg }, 502);
+  }
+  anfrWinner = used.id; anfrWinnerAt = Date.now();
+  const { sites, noCoord } = groupSites(rows, lat, lon, radiusKm);
+  const winAtt = attempts.find(a => a.strategy === used.id);
+  const body = { anfrOk: true, sites, communes, route: used.id,
+    truncated: !!(winAtt && winAtt.calls.some(c => c.truncated)), noCoord: noCoord || undefined };
   telecomCache.set(ckey, { t: Date.now(), body });
   if (telecomCache.size > 200) telecomCache.delete(telecomCache.keys().next().value);
-  return json(body);
+  return json(debug ? { ...body, debug: dbg } : body);
 }
 
 
@@ -245,7 +386,8 @@ async function handleTelecom(req, env, allowed) {
   const lat = parseFloat(url.searchParams.get('lat')), lon = parseFloat(url.searchParams.get('lon'));
   const radius = parseFloat(url.searchParams.get('radius_km'));
   if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return json({ error: 'lat/lon invalides' }, 400);
-  try { return await telecom(env, lat, lon, radius, json); }
+  const debug = url.searchParams.get('debug') === 'all' ? 'all' : url.searchParams.get('debug') ? '1' : '';
+  try { return await telecom(env, lat, lon, radius, json, debug); }
   catch (e) { return json({ anfrOk: false, error: 'erreur du relais : ' + (e && e.message || e) }, 502); }
 }
 
