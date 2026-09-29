@@ -18,6 +18,8 @@
      /telecom?lat=&lon=&radius_km=            -> pylones/points hauts telecom (ANFR, France uniquement)
               [&debug=1|all]                     debug=1 : detail de chaque route ANFR essayee ;
                                                   debug=all : les essaie TOUTES (comparaison)
+     /monuments?lat=&lon=&radius_km=[&min_links=][&debug=1] -> monuments emblematiques (Wikidata : notoriete = langues
+                                                  Wikipedia, hauteur) ; cache 7 jours partage
      /geoapify?lat=&lon=&radius_km=&kind=     -> villes/sommets/POI (Geoapify Places), source
                                                   supplementaire en parallele d'Overpass/OpenFreeMap ;
                                                   kind = villes|sommets|lighthouse|view|heritage|beach
@@ -365,6 +367,8 @@ export default {
     // /telecom : pylones et points hauts ANFR (France uniquement) ; parametres lat/lon/radius_km,
     // distincts du format lamin/lomin/lamax/lomax utilise par /planes et /ships
     if (url.pathname === '/telecom') return handleTelecom(req, env, allowed);
+    // /monuments : lieux emblematiques autour d'un point (Wikidata, cache partage) ; ?debug=1 detaille
+    if (url.pathname === '/monuments') return handleMonuments(req, env, allowed);
 
     // /check : verifie reellement les identifiants (pas seulement leur presence) aupres
     // des deux services, pour que le diagnostic de l'app distingue "absent" de "invalide".
@@ -427,6 +431,111 @@ async function handleTelecom(req, env, allowed) {
   const debug = url.searchParams.get('debug') === 'all' ? 'all' : url.searchParams.get('debug') ? '1' : '';
   try { return await telecom(env, lat, lon, radius, json, debug); }
   catch (e) { return json({ anfrOk: false, error: 'erreur du relais : ' + (e && e.message || e) }, 502); }
+}
+
+// ---------------- /monuments : lieux emblematiques (Wikidata) ----------------
+// Retour terrain du 29/09/2026 : la 1re version interrogeait OpenStreetMap depuis le telephone sur
+// 40 km autour de Paris ; les 3 miroirs Overpass depassaient tous le delai. Wikidata sait repondre
+// directement a "les structures les plus celebres autour de ce point" (SERVICE wikibase:around), triees
+// par notoriete = nombre de langues ou elles ont un article Wikipedia. Le relais interroge Wikidata,
+// garde la reponse 7 jours (un monument ne bouge pas) et la partage entre tous les appareils.
+// Deux variantes en cascade : "full" (structures au sens large, sous-classes comprises) puis "light"
+// (liste fermee de classes, requete beaucoup plus legere). ?debug=1 detaille chaque tentative.
+const WDQS_URL = 'https://query.wikidata.org/sparql';
+const WDQS_UA = 'villes-horizon-relais/1.0 (https://github.com/rousseauromain-art/Ar_city)';
+const MON_MAX_KM = 45, MON_LIMIT = 250, MON_CELL_DEG = 0.05, MON_CACHE_S = 7 * 86400;
+const monMemCache = new Map();
+// racines de "monument" : structure architecturale, musee, monument, attraction touristique
+const MON_ROOTS = 'wd:Q811979 wd:Q33506 wd:Q4989906 wd:Q570116';
+// classes directes usuelles (variante legere) : tour, tour d'observation, gratte-ciel, batiment, structure,
+// monument, attraction, eglise, cathedrale, eglise paroissiale, chapelle, chateau, palais, musee, pont, stade, statue, arc
+const MON_CLASSES = 'wd:Q12518 wd:Q1440300 wd:Q11303 wd:Q41176 wd:Q811979 wd:Q4989906 wd:Q570116 wd:Q16970 wd:Q2977 wd:Q317557 wd:Q108325 wd:Q23413 wd:Q16560 wd:Q33506 wd:Q12280 wd:Q483110 wd:Q179700 wd:Q1075 wd:Q1329623 wd:Q1081138';
+function sparqlMonuments(lat, lon, radiusKm, minLinks, full) {
+  const cls = full ? `VALUES ?root { ${MON_ROOTS} } ?i wdt:P31 ?t . ?t wdt:P279* ?root .` : `VALUES ?t { ${MON_CLASSES} } ?i wdt:P31 ?t .`;
+  return `SELECT ?i ?iLabel ?sl ?lat ?lon (MAX(?hh) AS ?h) (GROUP_CONCAT(DISTINCT ?tLabel; separator="|") AS ?types) WHERE {
+  SERVICE wikibase:around { ?i wdt:P625 ?loc . bd:serviceParam wikibase:center "Point(${lon.toFixed(5)} ${lat.toFixed(5)})"^^geo:wktLiteral . bd:serviceParam wikibase:radius "${radiusKm.toFixed(1)}" . }
+  ?i wikibase:sitelinks ?sl . FILTER(?sl >= ${Math.round(minLinks)})
+  ${cls}
+  BIND(geof:latitude(?loc) AS ?lat) BIND(geof:longitude(?loc) AS ?lon)
+  OPTIONAL { ?i p:P2048/psn:P2048/wikibase:quantityAmount ?hh }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "fr,en". }
+} GROUP BY ?i ?iLabel ?sl ?lat ?lon ORDER BY DESC(?sl) LIMIT ${MON_LIMIT}`;
+}
+// reponse WDQS -> liste plate {qid,name,lat,lon,links,ht,types}
+function normWdqs(j) {
+  const b = j && j.results && j.results.bindings;
+  if (!Array.isArray(b)) throw new Error('format Wikidata inattendu');
+  const out = [], seen = new Set();
+  for (const r of b) {
+    const qid = r.i && /Q\d+$/.exec(r.i.value || ''); if (!qid) continue;
+    const name = r.iLabel && r.iLabel.value; if (!name || /^Q\d+$/.test(name)) continue; // sans etiquette : inutilisable
+    const lat = parseFloat(r.lat && r.lat.value), lon = parseFloat(r.lon && r.lon.value);
+    if (!isFinite(lat) || !isFinite(lon) || seen.has(qid[0])) continue; seen.add(qid[0]);
+    const h = parseFloat(r.h && r.h.value);
+    out.push({ qid: qid[0], name, lat, lon, links: parseInt(r.sl && r.sl.value, 10) || 0, ht: isFinite(h) && h > 0 ? Math.round(h) : null, types: (r.types && r.types.value) || '' });
+  }
+  return out;
+}
+async function monuments(env, lat, lon, radiusKm, minLinks, json, debug) {
+  radiusKm = Math.min(MON_MAX_KM, Math.max(2, radiusKm || 30));
+  minLinks = Math.min(300, Math.max(10, minLinks || 40));
+  // centre arrondi sur une grille de ~5 km : deux visiteurs proches partagent la meme reponse en cache
+  const latC = Math.round(lat / MON_CELL_DEG) * MON_CELL_DEG, lonC = Math.round(lon / MON_CELL_DEG) * MON_CELL_DEG;
+  const radQ = Math.min(MON_MAX_KM + 6, Math.ceil(radiusKm + 6)); // marge : le vrai point est jusqu'a ~4 km du centre arrondi
+  const ckey = `monuments:${latC.toFixed(2)},${lonC.toFixed(2)},${radQ},${minLinks}`;
+  if (!debug) {
+    const mem = monMemCache.get(ckey);
+    if (mem && Date.now() - mem.t < MON_CACHE_S * 1000) return json({ ...mem.body, cache: 'memoire' });
+    try {
+      if (typeof caches !== 'undefined' && caches.default) {
+        const hit = await caches.default.match(new Request('https://cache.villes-horizon.invalid/' + ckey));
+        if (hit) { const body = await hit.json(); monMemCache.set(ckey, { t: Date.now(), body }); return json({ ...body, cache: 'edge' }); }
+      }
+    } catch (e) {}
+  }
+  const attempts = []; let list = null, route = null;
+  for (const [id, full, ms] of [['wdqs-full', true, 28000], ['wdqs-light', false, 18000]]) {
+    const q = sparqlMonuments(latC, lonC, radQ, minLinks, full), t0 = Date.now(), att = { route: id, radiusKm: radQ };
+    try {
+      const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), ms);
+      let r; try {
+        r = await fetch(WDQS_URL, { method: 'POST', signal: ctrl.signal,
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/sparql-results+json', 'User-Agent': WDQS_UA },
+          body: 'query=' + encodeURIComponent(q) });
+      } finally { clearTimeout(timer); }
+      att.http = r.status;
+      if (!r.ok) throw new Error('HTTP ' + r.status + (r.status === 429 ? ' (Wikidata limite le debit)' : r.status >= 500 ? ' (requete trop lourde ou service surcharge)' : ''));
+      const txt = await r.text(); att.bytes = txt.length;
+      let j; try { j = JSON.parse(txt); } catch (e) { throw new Error('pas du JSON (' + txt.slice(0, 80).replace(/\s+/g, ' ') + ')'); }
+      list = normWdqs(j); att.ok = true; att.rows = list.length; route = id;
+    } catch (e) { att.ok = false; att.error = e && e.name === 'AbortError' ? `delai depasse (${ms / 1000} s)` : String(e && e.message || e); }
+    att.ms = Date.now() - t0; attempts.push(att);
+    if (list) break;
+  }
+  const dbg = debug ? { attempts, cell: [latC, lonC], radiusQueried: radQ, minLinks, sparql: sparqlMonuments(latC, lonC, radQ, minLinks, true) } : undefined;
+  if (!list) return json({ monumentsOk: false, error: 'Wikidata : ' + attempts.map(a => `${a.route} ${a.error}`).join(' | '), debug: dbg }, 502);
+  const body = { monumentsOk: true, monuments: list, route, cell: [latC, lonC], radius_km: radQ };
+  monMemCache.set(ckey, { t: Date.now(), body });
+  if (monMemCache.size > 60) monMemCache.delete(monMemCache.keys().next().value);
+  try {
+    if (typeof caches !== 'undefined' && caches.default && list.length) {
+      await caches.default.put(new Request('https://cache.villes-horizon.invalid/' + ckey),
+        new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=' + MON_CACHE_S } }));
+    }
+  } catch (e) {}
+  return json(debug ? { ...body, debug: dbg } : body);
+}
+async function handleMonuments(req, env, allowed) {
+  const url = new URL(req.url);
+  const origin = req.headers.get('Origin') || '';
+  const cors = { 'Access-Control-Allow-Origin': allowed.includes(origin) ? origin : allowed[0], 'Access-Control-Allow-Methods': 'GET, OPTIONS', 'Access-Control-Max-Age': '86400', 'Vary': 'Origin' };
+  const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { ...cors, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
+  const lat = parseFloat(url.searchParams.get('lat')), lon = parseFloat(url.searchParams.get('lon'));
+  if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return json({ error: 'lat/lon invalides' }, 400);
+  const radius = parseFloat(url.searchParams.get('radius_km')), minLinks = parseFloat(url.searchParams.get('min_links'));
+  const debug = url.searchParams.get('debug') ? '1' : '';
+  try { return await monuments(env, lat, lon, radius, minLinks, json, debug); }
+  catch (e) { return json({ monumentsOk: false, error: 'erreur du relais : ' + (e && e.message || e) }, 502); }
 }
 
 // ---------------- /geoapify : villes/sommets/POI supplementaires (Geoapify Places API) ----------------
