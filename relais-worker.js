@@ -476,14 +476,14 @@ function normWdqs(j) {
   }
   return out;
 }
-async function monuments(env, lat, lon, radiusKm, minLinks, json, debug) {
+async function monuments(env, lat, lon, radiusKm, minLinks, json, debug, pad = 6, nocache = false) {
   radiusKm = Math.min(MON_MAX_KM, Math.max(2, radiusKm || 30));
   minLinks = Math.min(300, Math.max(10, minLinks || 40));
   // centre arrondi sur une grille de ~5 km : deux visiteurs proches partagent la meme reponse en cache
   const latC = Math.round(lat / MON_CELL_DEG) * MON_CELL_DEG, lonC = Math.round(lon / MON_CELL_DEG) * MON_CELL_DEG;
-  const radQ = Math.min(MON_MAX_KM + 6, Math.ceil(radiusKm + 6)); // marge : le vrai point est jusqu'a ~4 km du centre arrondi
+  const radQ = Math.min(MON_MAX_KM + 6, Math.ceil(radiusKm + pad)); // marge (pad : 6 km par defaut ; les tuiles de l'appli en demandent 2) : le vrai point est jusqu'a ~4 km du centre arrondi
   const ckey = `monuments:${latC.toFixed(2)},${lonC.toFixed(2)},${radQ},${minLinks}`;
-  if (!debug) {
+  if (!debug && !nocache) { // nocache=1 : force un appel Wikidata frais et remplace l'entree en cache
     const mem = monMemCache.get(ckey);
     if (mem && Date.now() - mem.t < MON_CACHE_S * 1000) return json({ ...mem.body, cache: 'memoire' });
     try {
@@ -534,7 +534,8 @@ async function handleMonuments(req, env, allowed) {
   if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return json({ error: 'lat/lon invalides' }, 400);
   const radius = parseFloat(url.searchParams.get('radius_km')), minLinks = parseFloat(url.searchParams.get('min_links'));
   const debug = url.searchParams.get('debug') ? '1' : '';
-  try { return await monuments(env, lat, lon, radius, minLinks, json, debug); }
+  const pad = Math.min(6, Math.max(0, parseFloat(url.searchParams.get('pad')))); const nocache = !!url.searchParams.get('nocache');
+  try { return await monuments(env, lat, lon, radius, minLinks, json, debug, isFinite(pad) ? pad : 6, nocache); }
   catch (e) { return json({ monumentsOk: false, error: 'erreur du relais : ' + (e && e.message || e) }, 502); }
 }
 
