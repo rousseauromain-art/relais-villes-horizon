@@ -369,6 +369,8 @@ export default {
     if (url.pathname === '/telecom') return handleTelecom(req, env, allowed);
     // /monuments : lieux emblematiques autour d'un point (Wikidata, cache partage) ; ?debug=1 detaille
     if (url.pathname === '/monuments') return handleMonuments(req, env, allowed);
+    // /bdtopo : tuile vectorielle BD TOPO (batiments) de l'IGN, relayee avec CORS + cache (repli si l'IGN refuse le navigateur)
+    if (url.pathname === '/bdtopo') return handleBdtopo(req, env, allowed);
 
     // /check : verifie reellement les identifiants (pas seulement leur presence) aupres
     // des deux services, pour que le diagnostic de l'app distingue "absent" de "invalide".
@@ -537,6 +539,28 @@ async function handleMonuments(req, env, allowed) {
   const pad = Math.min(6, Math.max(0, parseFloat(url.searchParams.get('pad')))); const nocache = !!url.searchParams.get('nocache');
   try { return await monuments(env, lat, lon, radius, minLinks, json, debug, isFinite(pad) ? pad : 6, nocache); }
   catch (e) { return json({ monumentsOk: false, error: 'erreur du relais : ' + (e && e.message || e) }, 502); }
+}
+
+// ---------------- /bdtopo : tuiles vectorielles BD TOPO (couche batiment) de l'IGN ----------------
+// Silhouette des batiments de l'appli : l'appli essaie d'abord l'IGN en direct ; si le navigateur est
+// refuse (CORS) ou si le service echoue, elle passe par ici. Tuiles statiques : cache edge 30 jours.
+const BDTOPO_URL = 'https://data.geopf.fr/tms/1.0.0/BDTOPO';
+async function handleBdtopo(req, env, allowed) {
+  const url = new URL(req.url);
+  const origin = req.headers.get('Origin') || '';
+  const cors = { 'Access-Control-Allow-Origin': allowed.includes(origin) ? origin : allowed[0], 'Access-Control-Allow-Methods': 'GET, OPTIONS', 'Access-Control-Max-Age': '86400', 'Vary': 'Origin' };
+  const err = (status, msg) => new Response(JSON.stringify({ error: msg }), { status, headers: { ...cors, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
+  const z = parseInt(url.searchParams.get('z'), 10), x = parseInt(url.searchParams.get('x'), 10), y = parseInt(url.searchParams.get('y'), 10);
+  if (![z, x, y].every(Number.isInteger) || z < 12 || z > 16 || x < 0 || y < 0 || x >= 2 ** z || y >= 2 ** z) return err(400, 'z (12-16), x, y invalides');
+  const ckey = new Request(`https://cache.villes-horizon.invalid/bdtopo/${z}/${x}/${y}`);
+  try { if (typeof caches !== 'undefined' && caches.default) { const hit = await caches.default.match(ckey); if (hit) return new Response(hit.body, { status: 200, headers: { ...cors, 'Content-Type': 'application/x-protobuf', 'Cache-Control': 'public, max-age=86400', 'X-Cache': 'edge' } }); } } catch (e) {}
+  let r;
+  try { r = await fetch(`${BDTOPO_URL}/${z}/${x}/${y}.pbf`, { headers: { 'User-Agent': 'villes-horizon-relais' } }); } catch (e) { return err(502, 'IGN injoignable : ' + (e && e.message || e)); }
+  if (r.status === 404) return new Response(new Uint8Array(0), { status: 200, headers: { ...cors, 'Content-Type': 'application/x-protobuf', 'Cache-Control': 'public, max-age=3600', 'X-Cache': 'vide' } }); // tuile sans donnee
+  if (!r.ok) return err(502, 'IGN : HTTP ' + r.status);
+  const buf = await r.arrayBuffer();
+  try { if (typeof caches !== 'undefined' && caches.default) await caches.default.put(ckey, new Response(buf, { headers: { 'Content-Type': 'application/x-protobuf', 'Cache-Control': 'public, max-age=' + 30 * 86400 } })); } catch (e) {}
+  return new Response(buf, { status: 200, headers: { ...cors, 'Content-Type': 'application/x-protobuf', 'Cache-Control': 'public, max-age=86400', 'X-Cache': 'miss' } });
 }
 
 // ---------------- /geoapify : villes/sommets/POI supplementaires (Geoapify Places API) ----------------
