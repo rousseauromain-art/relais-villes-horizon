@@ -456,9 +456,10 @@ const MON_CLASSES = 'wd:Q12518 wd:Q1440300 wd:Q11303 wd:Q41176 wd:Q811979 wd:Q49
 function sparqlMonuments(lat, lon, radiusKm, minLinks, full, prot) {
   const cls = full ? `VALUES ?root { ${MON_ROOTS} } ?i wdt:P31 ?t . ?t wdt:P279* ?root .` : `VALUES ?t { ${MON_CLASSES} } ?i wdt:P31 ?t .`;
   // prot (regle "patrimoine", 08/10/2026) : un lieu compte s'il est assez connu (>= minLinks langues) OU protege comme
-  // monument historique (propriete P1435) : a Rennes, le Parlement de Bretagne n'a que 9 langues, les Jacobins 3.
+  // monument historique CLASSE ou INSCRIT (propriete P1435 dont la valeur s'appelle "monument historique ..." ; les autres
+  // valeurs de P1435, comme "bien recense dans l'Inventaire general", ne sont PAS une protection) : a Rennes, le Parlement de Bretagne n'a que 9 langues, les Jacobins 3.
   const sel = prot ? ' (MAX(IF(BOUND(?mh),1,0)) AS ?mhf)' : '';
-  const flt = prot ? `OPTIONAL { ?i wdt:P1435 ?mh } FILTER(?sl >= ${Math.round(minLinks)} || BOUND(?mh))` : `FILTER(?sl >= ${Math.round(minLinks)})`;
+  const flt = prot ? `OPTIONAL { ?i wdt:P1435 ?mh . ?mh rdfs:label ?mhl . FILTER(LANG(?mhl) = "fr" && REGEX(?mhl, "^monument historique", "i")) } FILTER(?sl >= ${Math.round(minLinks)} || BOUND(?mh))` : `FILTER(?sl >= ${Math.round(minLinks)})`;
   return `SELECT ?i ?iLabel ?sl ?lat ?lon (MAX(?hh) AS ?h) (GROUP_CONCAT(DISTINCT ?tLabel; separator="|") AS ?types)${sel} WHERE {
   SERVICE wikibase:around { ?i wdt:P625 ?loc . bd:serviceParam wikibase:center "Point(${lon.toFixed(5)} ${lat.toFixed(5)})"^^geo:wktLiteral . bd:serviceParam wikibase:radius "${radiusKm.toFixed(1)}" . }
   ?i wikibase:sitelinks ?sl .
