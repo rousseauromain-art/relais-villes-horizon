@@ -21,6 +21,8 @@
      /monuments?lat=&lon=&radius_km=[&min_links=][&prot=1][&debug=1] -> monuments emblematiques (Wikidata : notoriete =
                                                   langues Wikipedia, hauteur ; prot=1 : + monuments historiques,
                                                   quel que soit le nb de langues) ; cache 7 jours partage
+     /wdtile?lat=&lon=[&min_links=][&debug=1]  -> tout lieu Wikidata geolocalise d'une tuile de 0,1 deg (monuments, stades,
+                                                  gares, canaux, parcs...) avec ses classes ; tri fait par l'appli ; cache 30 jours
      /geoapify?lat=&lon=&radius_km=&kind=     -> villes/sommets/POI (Geoapify Places), source
                                                   supplementaire en parallele d'Overpass/OpenFreeMap ;
                                                   kind = villes|sommets|lighthouse|view|heritage|beach
@@ -59,7 +61,7 @@ const ANFR_API = 'https://data.anfr.fr/d4c/api/records/';
 const GEO_BASE = 'https://geo.api.gouv.fr/communes';
 const TPO_URL = 'https://data.anfr.fr/sites/default/files/dataset/dd1/1fac6-4531-4a27-9c8c-a3a9e4ec2107/sup_proprietaire_0.txt';
 const NAT_URL = 'https://data.anfr.fr/sites/default/files/dataset/dd1/1fac6-4531-4a27-9c8c-a3a9e4ec2107/sup_nature_0.txt';
-const TELECOM_MAX_KM = 15, TELECOM_MAX_COMMUNES = 12, TELECOM_CACHE_MS = 5 * 60000;
+const TELECOM_MAX_KM = 15, TELECOM_MAX_COMMUNES = 12, TELECOM_CACHE_MS = 5 * 60000, TELECOM_EDGE_S = 86400, TELECOM_CELL = 0.005;
 const ANFR_ROWS = 5000;          // lignes max par requete (une ligne = un operateur x un systeme radio)
 const ANFR_TIMEOUT_MS = 12000;
 const ANFR_FAIL_MS = 15 * 60000; // une route en echec passe en fin de liste pendant 15 min
@@ -257,6 +259,26 @@ async function telecom(env, lat, lon, radiusKm, json, debug) {
   const ckey = `${lat.toFixed(3)},${lon.toFixed(3)},${radiusKm}`;
   const hit = telecomCache.get(ckey);
   if (!debug && hit && Date.now() - hit.t < TELECOM_CACHE_MS) return json({ ...hit.body, cache: true });
+  // cache DURABLE du relais (08/10/2026) : la memoire de l'isolat (5 min) etait perdue au moindre recyclage et ne servait
+  // qu'a un point exact au metre pres. Cle quantifiee (~500 m) ; 24 h : les supports ANFR bougent tres peu.
+  const ekey = `telecom:${(Math.round(lat / TELECOM_CELL) * TELECOM_CELL).toFixed(3)},${(Math.round(lon / TELECOM_CELL) * TELECOM_CELL).toFixed(3)},${radiusKm}`;
+  const edgeReq = () => new Request('https://cache.villes-horizon.invalid/' + ekey);
+  if (!debug) {
+    try {
+      if (typeof caches !== 'undefined' && caches.default) {
+        const eh = await caches.default.match(edgeReq());
+        if (eh) { const body = await eh.json(); telecomCache.set(ckey, { t: Date.now(), body }); return json({ ...body, cache: 'edge' }); }
+      }
+    } catch (e) {}
+  }
+  const telStore = async body => {
+    telecomCache.set(ckey, { t: Date.now(), body });
+    try {
+      if (typeof caches !== 'undefined' && caches.default && (body.hors_france || (body.sites && body.sites.length))) {
+        await caches.default.put(edgeReq(), new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=' + TELECOM_EDGE_S } }));
+      }
+    } catch (e) {}
+  };
 
   await ensureLookups();
   // communes : calculees seulement si une route "par commune" en a besoin (la route par rayon s'en
@@ -280,7 +302,7 @@ async function telecom(env, lat, lon, radiusKm, json, debug) {
       ctx.communes = (await getCommunes()).slice(0, TELECOM_MAX_COMMUNES);
       if (!ctx.communes.length && !communesAll.length && !rows) {
         const body = { anfrOk: true, hors_france: true, sites: [], communes: [] };
-        telecomCache.set(ckey, { t: Date.now(), body });
+        await telStore(body);
         return json(debug ? { ...body, debug: { communesMs, attempts, note: 'geo.api.gouv.fr : aucune commune (hors de France, ou service en panne)' } } : body);
       }
     }
@@ -314,7 +336,7 @@ async function telecom(env, lat, lon, radiusKm, json, debug) {
       const j = r.ok ? await r.json() : null;
       if (Array.isArray(j) && !j.length) {
         const body = { anfrOk: true, hors_france: true, sites: [], communes: [] };
-        telecomCache.set(ckey, { t: Date.now(), body });
+        await telStore(body);
         return json(debug ? { ...body, debug: dbg } : body);
       }
     } catch (e) {}
@@ -323,7 +345,7 @@ async function telecom(env, lat, lon, radiusKm, json, debug) {
   const body = { anfrOk: true, sites, communes: ctx.communes, route: used.id,
     radius_km: radiusKm, radius_eff: radiusEff < radiusKm ? radiusEff : undefined,
     truncated: !!(winAtt && winAtt.calls.some(c => c.truncated)), noCoord: noCoord || undefined };
-  telecomCache.set(ckey, { t: Date.now(), body });
+  await telStore(body);
   if (telecomCache.size > 200) telecomCache.delete(telecomCache.keys().next().value);
   return json(debug ? { ...body, debug: dbg } : body);
 }
@@ -370,6 +392,8 @@ export default {
     if (url.pathname === '/telecom') return handleTelecom(req, env, allowed);
     // /monuments : lieux emblematiques autour d'un point (Wikidata, cache partage) ; ?debug=1 detaille
     if (url.pathname === '/monuments') return handleMonuments(req, env, allowed);
+    // /wdtile : tout Wikidata geolocalise d'une tuile de 0,1 deg (sans filtre de classe, tri fait par l'appli), cache edge 30 jours
+    if (url.pathname === '/wdtile') return handleWdTile(req, env, allowed);
     // /bdtopo : tuile vectorielle BD TOPO (batiments) de l'IGN, relayee avec CORS + cache (repli si l'IGN refuse le navigateur)
     if (url.pathname === '/bdtopo') return handleBdtopo(req, env, allowed);
 
@@ -556,6 +580,115 @@ async function handleMonuments(req, env, allowed) {
   const pad = Math.min(6, Math.max(0, parseFloat(url.searchParams.get('pad')))); const nocache = !!url.searchParams.get('nocache'); const prot = url.searchParams.get('prot') === '1';
   try { return await monuments(env, lat, lon, radius, minLinks, json, debug, isFinite(pad) ? pad : 6, nocache, prot); }
   catch (e) { return json({ monumentsOk: false, error: 'erreur du relais : ' + (e && e.message || e) }, 502); }
+}
+
+// ---------------- /wdtile : tout ce que Wikidata sait d'une tuile (refonte du 08/10/2026) ----------------
+// Retour de Rennes : avec une liste fermee de classes (eglise, chateau, musee...) il manquait le canal, le stade
+// Roazhon Park, les stations de metro, le couvent des Jacobins, la place Sainte-Anne... Cette route ne filtre donc
+// PLUS par classe : une requete par tuile de 0,1 deg (~7 x 11 km) renvoie tout lieu geolocalise ayant un article
+// Wikipedia (>= minLinks langues) ou protege comme monument historique, avec ses classes (identifiants + libelles).
+// Le TRI (monument / equipement / a ecarter) est fait par l'appli, a partir de ces classes : le relais ne decide rien,
+// et la reponse reste la meme pour tous (cache edge 30 jours, cle = tuile). Seules sont ecartees ici les categories
+// qui n'ont aucune place sur un horizon (personnes, homonymies, films, albums, societes, evenements...).
+// Zone dense : si 1 langue est trop lourd pour Wikidata, on releve le seuil (1, 2, 4, 8) et la reponse l'indique.
+const WDT_SIZE = 0.1, WDT_LIMIT = 700, WDT_CACHE_S = 30 * 86400;
+const WDT_LADDER = [[1, 30000], [2, 20000], [4, 15000], [8, 12000]];
+// classes ecartees dans la requete (P31 direct) : personne, homonymie, article, film, album, single, oeuvre litteraire,
+// livre, festival, entreprise, societe, organisation, entreprise (au sens large), societe cotee, serie TV
+const WDT_BAD = 'wd:Q5 wd:Q4167410 wd:Q13442814 wd:Q11424 wd:Q482994 wd:Q134556 wd:Q7725634 wd:Q571 wd:Q132241 wd:Q4830453 wd:Q783794 wd:Q43229 wd:Q6881511 wd:Q891723 wd:Q5398426';
+const wdtMem = new Map();
+function wdtTile(lat, lon) { return [Math.floor(lat / WDT_SIZE + 1e-9), Math.floor(lon / WDT_SIZE + 1e-9)]; }
+function sparqlWdTile(iy, ix, minLinks) {
+  const s = +(iy * WDT_SIZE).toFixed(4), w = +(ix * WDT_SIZE).toFixed(4), n = +(s + WDT_SIZE).toFixed(4), e = +(w + WDT_SIZE).toFixed(4);
+  // monument historique CLASSE ou INSCRIT : P1435 dont la valeur s'appelle "monument historique ..." (voir sparqlMonuments)
+  return `SELECT ?i ?iLabel ?sl ?lat ?lon (MAX(?hh) AS ?h) (GROUP_CONCAT(DISTINCT ?tl; separator="|") AS ?types) (GROUP_CONCAT(DISTINCT STRAFTER(STR(?t), "/entity/"); separator="|") AS ?tq) (MAX(IF(BOUND(?mh),1,0)) AS ?mhf) WHERE {
+  SERVICE wikibase:box { ?i wdt:P625 ?loc . bd:serviceParam wikibase:cornerSouthWest "Point(${w} ${s})"^^geo:wktLiteral . bd:serviceParam wikibase:cornerNorthEast "Point(${e} ${n})"^^geo:wktLiteral . }
+  ?i wikibase:sitelinks ?sl .
+  OPTIONAL { ?i wdt:P1435 ?mh . ?mh rdfs:label ?mhl . FILTER(LANG(?mhl) = "fr" && REGEX(?mhl, "^monument historique", "i")) }
+  FILTER(?sl >= ${Math.round(minLinks)} || BOUND(?mh))
+  MINUS { VALUES ?bad { ${WDT_BAD} } ?i wdt:P31 ?bad . }
+  OPTIONAL { ?i wdt:P31 ?t . OPTIONAL { ?t rdfs:label ?tl . FILTER(LANG(?tl) IN ("fr","en")) } }
+  BIND(geof:latitude(?loc) AS ?lat) BIND(geof:longitude(?loc) AS ?lon)
+  OPTIONAL { ?i p:P2048/psn:P2048/wikibase:quantityAmount ?hh }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "fr,en". }
+} GROUP BY ?i ?iLabel ?sl ?lat ?lon ORDER BY DESC(?sl) LIMIT ${WDT_LIMIT}`;
+}
+function normWdTileRows(j) {
+  const b = j && j.results && j.results.bindings;
+  if (!Array.isArray(b)) throw new Error('format Wikidata inattendu');
+  const out = [], seen = new Set();
+  for (const r of b) {
+    const qid = r.i && /Q\d+$/.exec(r.i.value || ''); if (!qid) continue;
+    const name = r.iLabel && r.iLabel.value; if (!name || /^Q\d+$/.test(name)) continue;
+    const lat = parseFloat(r.lat && r.lat.value), lon = parseFloat(r.lon && r.lon.value);
+    if (!isFinite(lat) || !isFinite(lon) || seen.has(qid[0])) continue; seen.add(qid[0]);
+    const h = parseFloat(r.h && r.h.value);
+    out.push({ qid: qid[0], name, lat: +lat.toFixed(5), lon: +lon.toFixed(5), links: parseInt(r.sl && r.sl.value, 10) || 0,
+      ht: isFinite(h) && h > 0 ? Math.round(h) : null, types: (r.types && r.types.value) || '', tq: (r.tq && r.tq.value) || '',
+      ...(r.mhf && parseInt(r.mhf.value, 10) === 1 ? { prot: 1 } : {}) });
+  }
+  return out;
+}
+async function wdTile(env, lat, lon, minLinks, json, debug, nocache) {
+  const [iy, ix] = wdtTile(lat, lon);
+  minLinks = Math.min(80, Math.max(1, isFinite(minLinks) && minLinks > 0 ? Math.round(minLinks) : 1));
+  const ckey = `wdtile:v1:${iy},${ix},${minLinks}`;
+  if (!debug && !nocache) {
+    const mem = wdtMem.get(ckey);
+    if (mem && Date.now() - mem.t < WDT_CACHE_S * 1000) return json({ ...mem.body, cache: 'memoire' });
+    try {
+      if (typeof caches !== 'undefined' && caches.default) {
+        const hit = await caches.default.match(new Request('https://cache.villes-horizon.invalid/' + ckey));
+        if (hit) { const body = await hit.json(); wdtMem.set(ckey, { t: Date.now(), body }); return json({ ...body, cache: 'edge' }); }
+      }
+    } catch (e) {}
+  }
+  const ladder = WDT_LADDER.filter(([ml]) => ml >= minLinks); if (!ladder.length || ladder[0][0] !== minLinks) ladder.unshift([minLinks, 25000]);
+  const attempts = []; let list = null, used = minLinks;
+  for (const [ml, ms] of ladder) {
+    const q = sparqlWdTile(iy, ix, ml), t0 = Date.now(), att = { minLinks: ml };
+    try {
+      const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), ms);
+      let r; try {
+        r = await fetch(WDQS_URL, { method: 'POST', signal: ctrl.signal,
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/sparql-results+json', 'User-Agent': WDQS_UA },
+          body: 'query=' + encodeURIComponent(q) });
+      } finally { clearTimeout(timer); }
+      att.http = r.status;
+      if (!r.ok) throw new Error('HTTP ' + r.status + (r.status === 429 ? ' (Wikidata limite le debit)' : r.status >= 500 ? ' (requete trop lourde ou service surcharge)' : ''));
+      const txt = await r.text(); att.bytes = txt.length;
+      let j; try { j = JSON.parse(txt); } catch (e) { throw new Error('pas du JSON (' + txt.slice(0, 80).replace(/\s+/g, ' ') + ')'); }
+      list = normWdTileRows(j); att.ok = true; att.rows = list.length; used = ml;
+      att.limited = (j.results.bindings.length >= WDT_LIMIT);
+    } catch (e) { att.ok = false; att.error = e && e.name === 'AbortError' ? `delai depasse (${ms / 1000} s)` : String(e && e.message || e); }
+    att.ms = Date.now() - t0; attempts.push(att);
+    if (list) break;
+    if (/limite le debit/.test(att.error || '')) break;
+  }
+  const dbg = debug ? { attempts, tile: [iy, ix], sparql: sparqlWdTile(iy, ix, minLinks) } : undefined;
+  if (!list) return json({ wdOk: false, error: 'Wikidata : ' + attempts.map(a => `seuil ${a.minLinks} : ${a.error}`).join(' | '), debug: dbg }, 502);
+  const s = +(iy * WDT_SIZE).toFixed(4), w = +(ix * WDT_SIZE).toFixed(4);
+  const body = { wdOk: true, rows: list, tile: [s, w], size: WDT_SIZE, minLinks, minLinksUsed: used, truncated: !!(attempts.length && attempts[attempts.length - 1].limited) };
+  wdtMem.set(ckey, { t: Date.now(), body });
+  if (wdtMem.size > 80) wdtMem.delete(wdtMem.keys().next().value);
+  try {
+    if (typeof caches !== 'undefined' && caches.default) {
+      await caches.default.put(new Request('https://cache.villes-horizon.invalid/' + ckey),
+        new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=' + (list.length ? WDT_CACHE_S : 7 * 86400) } }));
+    }
+  } catch (e) {}
+  return json(debug ? { ...body, debug: dbg } : body);
+}
+async function handleWdTile(req, env, allowed) {
+  const url = new URL(req.url);
+  const origin = req.headers.get('Origin') || '';
+  const cors = { 'Access-Control-Allow-Origin': allowed.includes(origin) ? origin : allowed[0], 'Access-Control-Allow-Methods': 'GET, OPTIONS', 'Access-Control-Max-Age': '86400', 'Vary': 'Origin' };
+  const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { ...cors, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
+  const lat = parseFloat(url.searchParams.get('lat')), lon = parseFloat(url.searchParams.get('lon'));
+  if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return json({ error: 'lat/lon invalides' }, 400);
+  const minLinks = parseFloat(url.searchParams.get('min_links')); const debug = url.searchParams.get('debug') ? '1' : ''; const nocache = !!url.searchParams.get('nocache');
+  try { return await wdTile(env, lat, lon, minLinks, json, debug, nocache); }
+  catch (e) { return json({ wdOk: false, error: 'erreur du relais : ' + (e && e.message || e) }, 502); }
 }
 
 // ---------------- /bdtopo : tuiles vectorielles BD TOPO (couche batiment) de l'IGN ----------------
