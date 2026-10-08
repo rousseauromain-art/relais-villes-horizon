@@ -18,8 +18,9 @@
      /telecom?lat=&lon=&radius_km=            -> pylones/points hauts telecom (ANFR, France uniquement)
               [&debug=1|all]                     debug=1 : detail de chaque route ANFR essayee ;
                                                   debug=all : les essaie TOUTES (comparaison)
-     /monuments?lat=&lon=&radius_km=[&min_links=][&debug=1] -> monuments emblematiques (Wikidata : notoriete = langues
-                                                  Wikipedia, hauteur) ; cache 7 jours partage
+     /monuments?lat=&lon=&radius_km=[&min_links=][&prot=1][&debug=1] -> monuments emblematiques (Wikidata : notoriete =
+                                                  langues Wikipedia, hauteur ; prot=1 : + monuments historiques,
+                                                  quel que soit le nb de langues) ; cache 7 jours partage
      /geoapify?lat=&lon=&radius_km=&kind=     -> villes/sommets/POI (Geoapify Places), source
                                                   supplementaire en parallele d'Overpass/OpenFreeMap ;
                                                   kind = villes|sommets|lighthouse|view|heritage|beach
@@ -452,11 +453,16 @@ const MON_ROOTS = 'wd:Q811979 wd:Q33506 wd:Q4989906 wd:Q570116';
 // classes directes usuelles (variante legere) : tour, tour d'observation, gratte-ciel, batiment, structure,
 // monument, attraction, eglise, cathedrale, eglise paroissiale, chapelle, chateau, palais, musee, pont, stade, statue, arc
 const MON_CLASSES = 'wd:Q12518 wd:Q1440300 wd:Q11303 wd:Q41176 wd:Q811979 wd:Q4989906 wd:Q570116 wd:Q16970 wd:Q2977 wd:Q317557 wd:Q108325 wd:Q23413 wd:Q16560 wd:Q33506 wd:Q12280 wd:Q483110 wd:Q179700 wd:Q1075 wd:Q1329623 wd:Q1081138';
-function sparqlMonuments(lat, lon, radiusKm, minLinks, full) {
+function sparqlMonuments(lat, lon, radiusKm, minLinks, full, prot) {
   const cls = full ? `VALUES ?root { ${MON_ROOTS} } ?i wdt:P31 ?t . ?t wdt:P279* ?root .` : `VALUES ?t { ${MON_CLASSES} } ?i wdt:P31 ?t .`;
-  return `SELECT ?i ?iLabel ?sl ?lat ?lon (MAX(?hh) AS ?h) (GROUP_CONCAT(DISTINCT ?tLabel; separator="|") AS ?types) WHERE {
+  // prot (regle "patrimoine", 08/10/2026) : un lieu compte s'il est assez connu (>= minLinks langues) OU protege comme
+  // monument historique (propriete P1435) : a Rennes, le Parlement de Bretagne n'a que 9 langues, les Jacobins 3.
+  const sel = prot ? ' (MAX(IF(BOUND(?mh),1,0)) AS ?mhf)' : '';
+  const flt = prot ? `OPTIONAL { ?i wdt:P1435 ?mh } FILTER(?sl >= ${Math.round(minLinks)} || BOUND(?mh))` : `FILTER(?sl >= ${Math.round(minLinks)})`;
+  return `SELECT ?i ?iLabel ?sl ?lat ?lon (MAX(?hh) AS ?h) (GROUP_CONCAT(DISTINCT ?tLabel; separator="|") AS ?types)${sel} WHERE {
   SERVICE wikibase:around { ?i wdt:P625 ?loc . bd:serviceParam wikibase:center "Point(${lon.toFixed(5)} ${lat.toFixed(5)})"^^geo:wktLiteral . bd:serviceParam wikibase:radius "${radiusKm.toFixed(1)}" . }
-  ?i wikibase:sitelinks ?sl . FILTER(?sl >= ${Math.round(minLinks)})
+  ?i wikibase:sitelinks ?sl .
+  ${flt}
   ${cls}
   BIND(geof:latitude(?loc) AS ?lat) BIND(geof:longitude(?loc) AS ?lon)
   OPTIONAL { ?i p:P2048/psn:P2048/wikibase:quantityAmount ?hh }
@@ -474,17 +480,18 @@ function normWdqs(j) {
     const lat = parseFloat(r.lat && r.lat.value), lon = parseFloat(r.lon && r.lon.value);
     if (!isFinite(lat) || !isFinite(lon) || seen.has(qid[0])) continue; seen.add(qid[0]);
     const h = parseFloat(r.h && r.h.value);
-    out.push({ qid: qid[0], name, lat, lon, links: parseInt(r.sl && r.sl.value, 10) || 0, ht: isFinite(h) && h > 0 ? Math.round(h) : null, types: (r.types && r.types.value) || '' });
+    out.push({ qid: qid[0], name, lat, lon, links: parseInt(r.sl && r.sl.value, 10) || 0, ht: isFinite(h) && h > 0 ? Math.round(h) : null, types: (r.types && r.types.value) || '',
+      ...(r.mhf && parseInt(r.mhf.value, 10) === 1 ? { prot: 1 } : {}) });
   }
   return out;
 }
-async function monuments(env, lat, lon, radiusKm, minLinks, json, debug, pad = 6, nocache = false) {
+async function monuments(env, lat, lon, radiusKm, minLinks, json, debug, pad = 6, nocache = false, prot = false) {
   radiusKm = Math.min(MON_MAX_KM, Math.max(2, radiusKm || 30));
-  minLinks = Math.min(300, Math.max(10, minLinks || 40));
+  minLinks = Math.min(300, Math.max(1, isFinite(minLinks) && minLinks > 0 ? minLinks : 40));
   // centre arrondi sur une grille de ~5 km : deux visiteurs proches partagent la meme reponse en cache
   const latC = Math.round(lat / MON_CELL_DEG) * MON_CELL_DEG, lonC = Math.round(lon / MON_CELL_DEG) * MON_CELL_DEG;
   const radQ = Math.min(MON_MAX_KM + 6, Math.ceil(radiusKm + pad)); // marge (pad : 6 km par defaut ; les tuiles de l'appli en demandent 2) : le vrai point est jusqu'a ~4 km du centre arrondi
-  const ckey = `monuments:${latC.toFixed(2)},${lonC.toFixed(2)},${radQ},${minLinks}`;
+  const ckey = `monuments:${latC.toFixed(2)},${lonC.toFixed(2)},${radQ},${minLinks}${prot ? ',p' : ''}`;
   if (!debug && !nocache) { // nocache=1 : force un appel Wikidata frais et remplace l'entree en cache
     const mem = monMemCache.get(ckey);
     if (mem && Date.now() - mem.t < MON_CACHE_S * 1000) return json({ ...mem.body, cache: 'memoire' });
@@ -495,9 +502,14 @@ async function monuments(env, lat, lon, radiusKm, minLinks, json, debug, pad = 6
       }
     } catch (e) {}
   }
-  const attempts = []; let list = null, route = null;
-  for (const [id, full, ms] of [['wdqs-full', true, 28000], ['wdqs-light', false, 18000]]) {
-    const q = sparqlMonuments(latC, lonC, radQ, minLinks, full), t0 = Date.now(), att = { route: id, radiusKm: radQ };
+  const attempts = []; let list = null, route = null, minUsed = minLinks;
+  // cascade : requete complete, puis legere ; si le seuil est bas (zone dense comme Paris : des milliers de lieux a
+  // 3 langues) et que Wikidata n'y arrive pas, on relance en relevant le seuil de langues (15 puis 40) plutot que d'echouer
+  const plan = [['wdqs-full', true, minLinks, 22000], ['wdqs-light', false, minLinks, 16000]];
+  if (minLinks < 15) plan.push(['wdqs-light-15', false, 15, 12000]);
+  if (minLinks < 40) plan.push(['wdqs-light-40', false, 40, 12000]);
+  for (const [id, full, ml, ms] of plan) {
+    const q = sparqlMonuments(latC, lonC, radQ, ml, full, prot), t0 = Date.now(), att = { route: id, radiusKm: radQ, minLinks: ml };
     try {
       const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), ms);
       let r; try {
@@ -509,14 +521,15 @@ async function monuments(env, lat, lon, radiusKm, minLinks, json, debug, pad = 6
       if (!r.ok) throw new Error('HTTP ' + r.status + (r.status === 429 ? ' (Wikidata limite le debit)' : r.status >= 500 ? ' (requete trop lourde ou service surcharge)' : ''));
       const txt = await r.text(); att.bytes = txt.length;
       let j; try { j = JSON.parse(txt); } catch (e) { throw new Error('pas du JSON (' + txt.slice(0, 80).replace(/\s+/g, ' ') + ')'); }
-      list = normWdqs(j); att.ok = true; att.rows = list.length; route = id;
+      list = normWdqs(j); att.ok = true; att.rows = list.length; route = id; minUsed = ml;
     } catch (e) { att.ok = false; att.error = e && e.name === 'AbortError' ? `delai depasse (${ms / 1000} s)` : String(e && e.message || e); }
     att.ms = Date.now() - t0; attempts.push(att);
     if (list) break;
+    if (/limite le debit/.test(att.error || '')) break; // 429 : insister aggraverait
   }
-  const dbg = debug ? { attempts, cell: [latC, lonC], radiusQueried: radQ, minLinks, sparql: sparqlMonuments(latC, lonC, radQ, minLinks, true) } : undefined;
+  const dbg = debug ? { attempts, cell: [latC, lonC], radiusQueried: radQ, minLinks, prot, sparql: sparqlMonuments(latC, lonC, radQ, minLinks, true, prot) } : undefined;
   if (!list) return json({ monumentsOk: false, error: 'Wikidata : ' + attempts.map(a => `${a.route} ${a.error}`).join(' | '), debug: dbg }, 502);
-  const body = { monumentsOk: true, monuments: list, route, cell: [latC, lonC], radius_km: radQ };
+  const body = { monumentsOk: true, monuments: list, route, cell: [latC, lonC], radius_km: radQ, minLinksUsed: minUsed, ...(prot ? { prot: true } : {}) };
   monMemCache.set(ckey, { t: Date.now(), body });
   if (monMemCache.size > 60) monMemCache.delete(monMemCache.keys().next().value);
   try {
@@ -536,8 +549,8 @@ async function handleMonuments(req, env, allowed) {
   if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return json({ error: 'lat/lon invalides' }, 400);
   const radius = parseFloat(url.searchParams.get('radius_km')), minLinks = parseFloat(url.searchParams.get('min_links'));
   const debug = url.searchParams.get('debug') ? '1' : '';
-  const pad = Math.min(6, Math.max(0, parseFloat(url.searchParams.get('pad')))); const nocache = !!url.searchParams.get('nocache');
-  try { return await monuments(env, lat, lon, radius, minLinks, json, debug, isFinite(pad) ? pad : 6, nocache); }
+  const pad = Math.min(6, Math.max(0, parseFloat(url.searchParams.get('pad')))); const nocache = !!url.searchParams.get('nocache'); const prot = url.searchParams.get('prot') === '1';
+  try { return await monuments(env, lat, lon, radius, minLinks, json, debug, isFinite(pad) ? pad : 6, nocache, prot); }
   catch (e) { return json({ monumentsOk: false, error: 'erreur du relais : ' + (e && e.message || e) }, 502); }
 }
 
