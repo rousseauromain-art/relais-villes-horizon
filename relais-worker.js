@@ -434,7 +434,7 @@ export default {
 
     try {
       if (url.pathname === '/planes') return await planes(env, box, json);
-      if (url.pathname === '/ships') return await ships(env, box, json);
+      if (url.pathname === '/ships') return await ships(env, box, json, +url.searchParams.get('listen') || 0);
     } catch (e) {
       return json({ error: 'erreur du relais : ' + (e && e.message || e) }, 502);
     }
@@ -1019,15 +1019,17 @@ async function planes(env, b, json) {
 }
 
 // ---------------- navires : ecoute breve d'AISStream ----------------
-async function ships(env, b, json) {
+async function ships(env, b, json, listenReq) {
   if (!env.AIS_KEY) return json({ error: 'cle AISStream absente du relais (secret AIS_KEY)' }, 503);
 
   const cellKey = [b.lamin, b.lomin, b.lamax, b.lomax].map(v => v.toFixed(1)).join(',');
   let memo = shipMemo.get(cellKey);
   if (!memo) { memo = new Map(); shipMemo.set(cellKey, memo); if (shipMemo.size > 20) shipMemo.delete(shipMemo.keys().next().value); }
 
-  const listenMs = +cfg(env, 'AIS_LISTEN_MS');
-  let upstreamError = null, received = 0;
+  // ?listen=<ms> (diagnostic) : ecoute plus longue, 25 s au plus. Les navires au port/au mouillage n'emettent qu'une
+  // position toutes les ~3 min : 10 s n'en attrape qu'une petite fraction (Route du Rhum, Saint-Malo).
+  const listenMs = listenReq > 0 ? Math.min(25000, listenReq) : +cfg(env, 'AIS_LISTEN_MS');
+  let upstreamError = null, received = 0; const types = {};
   const t0 = Date.now();
 
   const resp = await fetch(cfg(env, 'AIS_URL'), { headers: { Upgrade: 'websocket' } });
@@ -1049,9 +1051,9 @@ async function ships(env, b, json) {
       let m;
       try { m = JSON.parse(typeof ev.data === 'string' ? ev.data : dec.decode(ev.data)); } catch (e) { return; }
       if (m.error) { upstreamError = String(m.error); done(); return; }
-      received++;
+      received++; types[m.MessageType] = (types[m.MessageType] || 0) + 1;
       absorb(memo, m);
-      if (received >= 500) done();
+      if (received >= 2000) done();
     });
     ws.addEventListener('close', done);
     ws.addEventListener('error', done);
@@ -1064,7 +1066,7 @@ async function ships(env, b, json) {
     if (v.lat == null) continue;
     list.push({ mmsi, ...v });
   }
-  return json({ ships: list, received, listenMs: now - t0, error: upstreamError });
+  return json({ ships: list, received, types, listenMs: now - t0, error: upstreamError });
 }
 
 function absorb(memo, m) {
