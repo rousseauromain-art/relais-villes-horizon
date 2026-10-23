@@ -434,6 +434,7 @@ export default {
 
     try {
       if (url.pathname === '/planes') return await planes(env, box, json);
+      if (url.pathname === '/ais-debug') return await aisDebug(env, box, url, json);
       if (url.pathname === '/ships') return await ships(env, box, json, +url.searchParams.get('listen') || 0);
     } catch (e) {
       return json({ error: 'erreur du relais : ' + (e && e.message || e) }, 502);
@@ -933,13 +934,15 @@ async function checkAis(env) {
     const ws = resp.webSocket;
     if (!ws) return `echec (AISStream a repondu ${resp.status})`;
     ws.accept();
-    ws.send(JSON.stringify({ APIKey: env.AIS_KEY, BoundingBoxes: [[[0, 0], [0.1, 0.1]]] }));
+    ws.send(JSON.stringify({ APIKey: env.AIS_KEY, BoundingBoxes: [[[48.0, -6.0], [51.5, 2.0]]] }));
     const out = await new Promise(resolve => {
       const done = v => { clearTimeout(t); resolve(v); };
-      const t = setTimeout(() => done('ok (cle acceptee, aucune erreur en 3 s — ne garantit pas la reception de donnees, voir /ships)'), 3000);
+      const t = setTimeout(() => done('ECHEC (aucun accuse de reception SubscriptionConfirmation en 6 s : flux AISStream muet, voir /ais-debug)'), 6000);
       ws.addEventListener('message', ev => {
         try { const m = JSON.parse(typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data));
-          if (m.error) done('echec (cle refusee : ' + m.error + ')'); else done('ok (cle acceptee, donnees recues)');
+          if (m.error) done('echec (cle refusee : ' + m.error + ')');
+          else if (m.MessageType === 'SubscriptionConfirmation') done('ok (abonnement confirme par AISStream' + (m.Message && m.Message.CompressionEnabled ? ', compression active' : ', sans compression') + ')');
+          else done('ok (donnees AIS recues)');
         } catch (e) {}
       });
       ws.addEventListener('close', () => done('echec (connexion fermee sans confirmation)'));
@@ -1018,6 +1021,59 @@ async function planes(env, b, json) {
   return json(body);
 }
 
+
+const maskKey = sub => ({ ...sub, APIKey: sub.APIKey ? sub.APIKey.slice(0, 4) + '…(' + sub.APIKey.length + ' car.)' : '(absente)' });
+
+// ---------------- /ais-debug : chronologie complete d'une session AISStream ----------------
+// ?variant=current|nofilter|wide|deflate (+ zone lamin/lomin/lamax/lomax), ?listen=ms (<= 12000)
+//  current  : abonnement exact de /ships        nofilter : meme zone, sans FilterMessageTypes
+//  wide     : toute la Manche (tres frequentee), sans filtre
+//  deflate  : demande explicitement permessage-deflate (la doc AISStream le recommande, bridage en debit des connexions non compressees depuis sept. 2026)
+async function aisDebug(env, b, url, json) {
+  if (!env.AIS_KEY) return json({ verdict: 'cle absente (secret AIS_KEY)', events: [] });
+  const variant = url.searchParams.get('variant') || 'current';
+  const listenMs = Math.min(12000, +url.searchParams.get('listen') || 8000);
+  const t0 = Date.now(), events = [], ev = (type, extra) => { if (events.length < 60) events.push({ ms: Date.now() - t0, type, ...extra }); };
+  const sub = { APIKey: env.AIS_KEY, BoundingBoxes: [[[b.lamin, b.lomin], [b.lamax, b.lomax]]] };
+  if (variant === 'current') sub.FilterMessageTypes = ['PositionReport', 'StandardClassBPositionReport', 'ExtendedClassBPositionReport', 'ShipStaticData'];
+  if (variant === 'wide') sub.BoundingBoxes = [[[48.0, -6.0], [51.5, 2.0]]];
+  const headers = { Upgrade: 'websocket' };
+  if (variant === 'deflate') headers['Sec-WebSocket-Extensions'] = 'permessage-deflate';
+  const out = { variant, sent: maskKey(sub), requestHeaders: headers, events, listenMs: 0, frames: 0, binaryFrames: 0, aisMessages: 0, confirmed: false, compression: null, types: {}, error: null };
+  let resp;
+  try { resp = await fetch(cfg(env, 'AIS_URL'), { headers }); } catch (e) { out.verdict = 'connexion impossible : ' + (e && e.message || e); ev('fetch-erreur', { msg: String(e && e.message || e) }); return json(out); }
+  ev('reponse-http', { status: resp.status, extensions: resp.headers.get('sec-websocket-extensions') || null });
+  const ws = resp.webSocket;
+  if (!ws) { out.verdict = `AISStream a refuse la connexion WebSocket (HTTP ${resp.status})`; return json(out); }
+  ws.accept(); ev('socket-ouverte');
+  ws.send(JSON.stringify(sub)); ev('abonnement-envoye', { octets: JSON.stringify(sub).length });
+  const dec = new TextDecoder();
+  await new Promise(resolve => {
+    const done = () => { clearTimeout(timer); resolve(); }, timer = setTimeout(done, listenMs);
+    ws.addEventListener('message', e => {
+      out.frames++;
+      const bin = typeof e.data !== 'string'; if (bin) out.binaryFrames++;
+      let txt; try { txt = bin ? dec.decode(e.data) : e.data; } catch (x) { ev('trame-illisible', { octets: e.data && e.data.byteLength }); return; }
+      let m; try { m = JSON.parse(txt); } catch (x) { ev('trame-pas-json', { octets: txt.length, debut: txt.slice(0, 120) }); return; }
+      if (m.error) { out.error = String(m.error); ev('erreur-amont', { msg: out.error }); done(); return; }
+      if (m.MessageType === 'SubscriptionConfirmation') { out.confirmed = true; out.compression = m.Message && m.Message.CompressionEnabled; ev('confirmation', { message: m.Message || m }); return; }
+      out.aisMessages++; out.types[m.MessageType] = (out.types[m.MessageType] || 0) + 1;
+      if (out.aisMessages <= 3) ev('ais', { type: m.MessageType, mmsi: m.MetaData && m.MetaData.MMSI, nom: m.MetaData && m.MetaData.ShipName, brut: txt.slice(0, 200) });
+      if (out.aisMessages >= 300) done();
+    });
+    ws.addEventListener('close', e => { ev('fermeture', { code: e.code, raison: e.reason || null }); out.closed = { code: e.code, reason: e.reason }; done(); });
+    ws.addEventListener('error', () => { ev('erreur-socket'); done(); });
+  });
+  try { ws.close(1000, 'fin'); } catch (e) {}
+  out.listenMs = Date.now() - t0;
+  out.verdict = out.error ? 'AISStream a renvoye une erreur : ' + out.error
+    : out.aisMessages > 0 ? `OK : ${out.aisMessages} messages AIS recus (${Object.keys(out.types).join(', ')})`
+    : out.closed ? `connexion fermee par AISStream (code ${out.closed.code}${out.closed.reason ? ', ' + out.closed.reason : ''}) sans donnees`
+    : out.confirmed ? 'abonnement confirme mais aucun message AIS : zone calme ou flux AISStream vide'
+    : 'AUCUN accuse de reception ni message : AISStream n\'a pas valide l\'abonnement (flux muet cote service, cf. github.com/aisstream/aisstream/issues/15)';
+  return json(out);
+}
+
 // ---------------- navires : ecoute breve d'AISStream ----------------
 async function ships(env, b, json, listenReq) {
   if (!env.AIS_KEY) return json({ error: 'cle AISStream absente du relais (secret AIS_KEY)' }, 503);
@@ -1029,7 +1085,7 @@ async function ships(env, b, json, listenReq) {
   // ?listen=<ms> (diagnostic) : ecoute plus longue, 25 s au plus. Les navires au port/au mouillage n'emettent qu'une
   // position toutes les ~3 min : 10 s n'en attrape qu'une petite fraction (Route du Rhum, Saint-Malo).
   const listenMs = listenReq > 0 ? Math.min(25000, listenReq) : +cfg(env, 'AIS_LISTEN_MS');
-  let upstreamError = null, received = 0; const types = {};
+  let upstreamError = null, received = 0, confirmed = false, closeInfo = null; const types = {};
   const t0 = Date.now();
 
   const resp = await fetch(cfg(env, 'AIS_URL'), { headers: { Upgrade: 'websocket' } });
@@ -1037,11 +1093,12 @@ async function ships(env, b, json, listenReq) {
   if (!ws) return json({ error: 'AISStream a refuse la connexion (' + resp.status + ')' }, 502);
   ws.accept();
   // l'abonnement doit partir dans les 3 s suivant la connexion
-  ws.send(JSON.stringify({
+  const sub = {
     APIKey: env.AIS_KEY,
     BoundingBoxes: [[[b.lamin, b.lomin], [b.lamax, b.lomax]]],
     FilterMessageTypes: ['PositionReport', 'StandardClassBPositionReport', 'ExtendedClassBPositionReport', 'ShipStaticData'],
-  }));
+  };
+  ws.send(JSON.stringify(sub));
 
   await new Promise(resolve => {
     const done = () => { clearTimeout(timer); resolve(); };
@@ -1051,11 +1108,12 @@ async function ships(env, b, json, listenReq) {
       let m;
       try { m = JSON.parse(typeof ev.data === 'string' ? ev.data : dec.decode(ev.data)); } catch (e) { return; }
       if (m.error) { upstreamError = String(m.error); done(); return; }
+      if (m.MessageType === 'SubscriptionConfirmation') { confirmed = true; return; }
       received++; types[m.MessageType] = (types[m.MessageType] || 0) + 1;
       absorb(memo, m);
       if (received >= 2000) done();
     });
-    ws.addEventListener('close', done);
+    ws.addEventListener('close', ev => { closeInfo = { code: ev.code, reason: ev.reason }; done(); });
     ws.addEventListener('error', done);
   });
   try { ws.close(1000, 'fin'); } catch (e) {}
@@ -1066,7 +1124,7 @@ async function ships(env, b, json, listenReq) {
     if (v.lat == null) continue;
     list.push({ mmsi, ...v });
   }
-  return json({ ships: list, received, types, listenMs: now - t0, error: upstreamError });
+  return json({ ships: list, received, types, confirmed, closeInfo, sent: maskKey(sub), listenMs: now - t0, error: upstreamError });
 }
 
 function absorb(memo, m) {
