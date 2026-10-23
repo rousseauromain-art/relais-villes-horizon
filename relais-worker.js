@@ -1044,14 +1044,16 @@ const maskKey = sub => ({ ...sub, APIKey: sub.APIKey ? sub.APIKey.slice(0, 4) + 
 async function aisDebug(env, b, url, json) {
   if (!env.AIS_KEY) return json({ verdict: 'cle absente (secret AIS_KEY)', events: [] });
   const variant = url.searchParams.get('variant') || 'current';
-  const listenMs = Math.min(12000, +url.searchParams.get('listen') || 8000);
+  const rawMode = url.searchParams.get('raw') === '1';
+  const listenMs = Math.min(rawMode ? 20000 : 12000, +url.searchParams.get('listen') || 8000);
   const t0 = Date.now(), events = [], ev = (type, extra) => { if (events.length < 60) events.push({ ms: Date.now() - t0, type, ...extra }); };
   const sub = { APIKey: env.AIS_KEY, BoundingBoxes: [[[b.lamin, b.lomin], [b.lamax, b.lomax]]] };
-  if (variant === 'current') sub.FilterMessageTypes = ['PositionReport', 'StandardClassBPositionReport', 'ExtendedClassBPositionReport', 'ShipStaticData'];
+  if (variant === 'current') sub.FilterMessageTypes = ['PositionReport', 'StandardClassBPositionReport', 'ExtendedClassBPositionReport', 'ShipStaticData', 'StaticDataReport'];
   if (variant === 'wide') sub.BoundingBoxes = [[[48.0, -6.0], [51.5, 2.0]]];
   const headers = { Upgrade: 'websocket' };
   if (variant === 'deflate') headers['Sec-WebSocket-Extensions'] = 'permessage-deflate';
   const out = { variant, sent: maskKey(sub), requestHeaders: headers, events, listenMs: 0, frames: 0, binaryFrames: 0, aisMessages: 0, confirmed: false, compression: null, types: {}, error: null };
+  const vessels = new Map(), raw = [];
   let resp;
   try { resp = await fetch(cfg(env, 'AIS_URL'), { headers }); } catch (e) { out.verdict = 'connexion impossible : ' + (e && e.message || e); ev('fetch-erreur', { msg: String(e && e.message || e) }); return json(out); }
   ev('reponse-http', { status: resp.status, extensions: resp.headers.get('sec-websocket-extensions') || null });
@@ -1071,6 +1073,14 @@ async function aisDebug(env, b, url, json) {
       if (m.error) { out.error = String(m.error); ev('erreur-amont', { msg: out.error }); done(); return; }
       if (m.MessageType === 'SubscriptionConfirmation') { out.confirmed = true; out.compression = m.Message && m.Message.CompressionEnabled; ev('confirmation', { message: m.Message || m }); return; }
       out.aisMessages++; out.types[m.MessageType] = (out.types[m.MessageType] || 0) + 1;
+      if (rawMode) { if (raw.length < 600) raw.push(m); // messages COMPLETS, tels qu'AISStream les envoie
+        const md = m.MetaData || {}, body = (m.Message && m.Message[m.MessageType]) || {};
+        const id = String((+md.MMSI > 0 ? md.MMSI : body.UserID) ?? md.MMSI);
+        const v = vessels.get(id) || { mmsi: id, nom: '', n: 0, types: {}, lat: null, lon: null, sog: null };
+        v.n++; v.types[m.MessageType] = (v.types[m.MessageType] || 0) + 1;
+        const nm = (md.ShipName || '').trim() || (body.Name || '').trim() || ((body.ReportA && body.ReportA.Name) || '').trim(); if (nm) v.nom = nm;
+        const la = body.Latitude ?? md.latitude, lo = body.Longitude ?? md.longitude; if (la != null) { v.lat = la; v.lon = lo; v.sog = body.Sog ?? v.sog; v.heure = md.time_utc; }
+        vessels.set(id, v); }
       if (out.aisMessages <= 3) ev('ais', { type: m.MessageType, mmsi: m.MetaData && m.MetaData.MMSI, nom: m.MetaData && m.MetaData.ShipName, brut: txt.slice(0, 200) });
       if (out.aisMessages >= 300) done();
     });
@@ -1079,6 +1089,7 @@ async function aisDebug(env, b, url, json) {
   });
   try { ws.close(1000, 'fin'); } catch (e) {}
   out.listenMs = Date.now() - t0;
+  if (rawMode) { out.vessels = [...vessels.values()]; out.raw = raw; }
   out.verdict = out.error ? 'AISStream a renvoye une erreur : ' + out.error
     : out.aisMessages > 0 ? `OK : ${out.aisMessages} messages AIS recus (${Object.keys(out.types).join(', ')})`
     : out.frames > 0 && !out.confirmed ? `${out.frames} trames recues mais illisibles (type ${out.dataType}) : probleme de decodage cote relais`
@@ -1110,7 +1121,7 @@ async function ships(env, b, json, listenReq) {
   const sub = {
     APIKey: env.AIS_KEY,
     BoundingBoxes: [[[b.lamin, b.lomin], [b.lamax, b.lomax]]],
-    FilterMessageTypes: ['PositionReport', 'StandardClassBPositionReport', 'ExtendedClassBPositionReport', 'ShipStaticData'],
+    FilterMessageTypes: ['PositionReport', 'StandardClassBPositionReport', 'ExtendedClassBPositionReport', 'ShipStaticData', 'StaticDataReport'],
   };
   ws.send(JSON.stringify(sub));
 
@@ -1144,7 +1155,9 @@ async function ships(env, b, json, listenReq) {
 
 function absorb(memo, m) {
   const md = m.MetaData || {}, msg = m.Message || {};
-  const mmsi = md.MMSI != null ? String(md.MMSI) : null;
+  // MMSI : MetaData.MMSI, sinon UserID du message (certains emetteurs mal configures donnent 0 dans MetaData)
+  const body0 = msg[m.MessageType] || {};
+  const mmsi = [md.MMSI, body0.UserID].map(v => (v != null && +v > 0) ? String(v) : null).find(Boolean) || (md.MMSI != null ? String(md.MMSI) : null);
   if (!mmsi) return;
   const cur = memo.get(mmsi) || { name: '', lat: null, lon: null, sog: 0, cog: 0, type: null, t: 0 };
   const nm = (md.ShipName || '').trim();
@@ -1153,6 +1166,13 @@ function absorb(memo, m) {
     const s = msg.ShipStaticData || {};
     if (s.Name && s.Name.trim()) cur.name = s.Name.trim();
     if (s.Type != null) cur.type = s.Type;
+    memo.set(mmsi, cur);
+    return;
+  }
+  if (m.MessageType === 'StaticDataReport') { // classe B : le nom est dans ReportA, le type dans ReportB (voiliers, plaisance)
+    const s = msg.StaticDataReport || {};
+    if (s.ReportA && s.ReportA.Name && s.ReportA.Name.trim()) cur.name = s.ReportA.Name.trim();
+    if (s.ReportB && s.ReportB.ShipType != null) cur.type = s.ReportB.ShipType;
     memo.set(mmsi, cur);
     return;
   }
