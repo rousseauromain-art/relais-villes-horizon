@@ -1099,9 +1099,92 @@ async function aisDebug(env, b, url, json) {
   return json(out);
 }
 
+
+// ---------------- AisHub : ecoute CONTINUE d'AISStream (Durable Object) ----------------
+// Un navire au port n'emet qu'une position toutes les ~3 min : une ecoute de 10-25 s par requete n'en voit qu'un sous-ensemble
+// au hasard, et la memoire d'un Worker ordinaire est perdue d'une requete a l'autre (isolats differents). Un Durable Object, lui,
+// garde UNE connexion AISStream ouverte et accumule les navires : apres ~3 min on a toute la zone, et /ships repond sans attente.
+// Un objet par zone (boite arrondie a 0,5°) ; il se ferme tout seul apres 5 min sans requete (la facturation suit la duree).
+// Limite AISStream : 3 connexions par compte -> au-dela de 3 zones actives, /ships retombe sur l'ancienne ecoute courte.
+const HUB_CELL = 0.5, HUB_IDLE_MS = 5 * 60000, HUB_TICK_MS = 60000, HUB_STALE_MS = 4 * 60000;
+const AIS_TYPES = ['PositionReport', 'StandardClassBPositionReport', 'ExtendedClassBPositionReport', 'ShipStaticData', 'StaticDataReport'];
+const hubBox = b => { const f = v => +v.toFixed(2); return { lamin: f(Math.floor(b.lamin / HUB_CELL) * HUB_CELL), lomin: f(Math.floor(b.lomin / HUB_CELL) * HUB_CELL), lamax: f(Math.ceil(b.lamax / HUB_CELL) * HUB_CELL), lomax: f(Math.ceil(b.lomax / HUB_CELL) * HUB_CELL) }; };
+
+export class AisHub {
+  constructor(state, env) {
+    this.state = state; this.env = env; this.memo = new Map(); this.ws = null; this.box = null;
+    this.lastReq = 0; this.lastMsg = 0; this.stats = { since: 0, received: 0, types: {}, confirmed: false, closeInfo: null, error: null };
+  }
+  async fetch(req) {
+    const u = new URL(req.url), n = k => parseFloat(u.searchParams.get(k));
+    const sub = { lamin: n('slamin'), lomin: n('slomin'), lamax: n('slamax'), lomax: n('slomax') };
+    const want = { lamin: n('lamin'), lomin: n('lomin'), lamax: n('lamax'), lomax: n('lomax') };
+    const reply = (o, st) => new Response(JSON.stringify(o), { status: st || 200, headers: { 'content-type': 'application/json' } });
+    if (!this.env.AIS_KEY) return reply({ fallback: true, error: 'cle AISStream absente' });
+    this.lastReq = Date.now(); this.box = this.box || sub;
+    const fresh = !this.ws;
+    if (fresh) await this.connect();
+    if (!this.ws) return reply({ fallback: true, error: this.stats.error || 'connexion AISStream impossible' });
+    try { await this.state.storage.setAlarm(Date.now() + HUB_TICK_MS); } catch (e) {}
+    // connexion neuve : on attend l'accusé, puis les premiers messages (comme l'ancienne ecoute) ; sinon reponse immediate
+    const t0 = Date.now(), maxWait = fresh || this.memo.size === 0 ? +(this.env.AIS_LISTEN_MS || 10000) : 0;
+    while (this.ws && Date.now() - t0 < maxWait && (!this.stats.confirmed || this.memo.size === 0)) await new Promise(r => setTimeout(r, 150));
+    const now = Date.now(), list = [];
+    for (const [mmsi, v] of this.memo) {
+      if (now - v.t > SHIP_TTL_MS) { this.memo.delete(mmsi); continue; }
+      if (v.lat == null || v.lat < want.lamin || v.lat > want.lamax || v.lon < want.lomin || v.lon > want.lomax) continue;
+      list.push({ mmsi, ...v });
+    }
+    return reply({ ships: list, received: this.stats.received, types: this.stats.types, confirmed: this.stats.confirmed, closeInfo: this.stats.closeInfo,
+      error: this.stats.error, listenMs: now - this.stats.since, hub: { listeningSince: this.stats.since, seconds: Math.round((now - this.stats.since) / 1000),
+      tracked: this.memo.size, box: this.box } });
+  }
+  async connect() {
+    const env = this.env, b = this.box;
+    this.stats = { since: Date.now(), received: 0, types: {}, confirmed: false, closeInfo: null, error: null }; this.lastMsg = Date.now();
+    let resp;
+    try { resp = await fetch(cfg(env, 'AIS_URL'), { headers: { Upgrade: 'websocket' } }); } catch (e) { this.stats.error = 'connexion : ' + (e && e.message || e); return; }
+    const ws = resp.webSocket;
+    if (!ws) { this.stats.error = 'AISStream a refuse la connexion (HTTP ' + resp.status + ')'; return; }
+    ws.accept(); try { ws.binaryType = 'arraybuffer'; } catch (e) {}
+    ws.send(JSON.stringify({ APIKey: env.AIS_KEY, BoundingBoxes: [[[b.lamin, b.lomin], [b.lamax, b.lomax]]], FilterMessageTypes: AIS_TYPES }));
+    ws.addEventListener('message', async ev => {
+      let m; try { m = JSON.parse(await frameText(ev.data)); } catch (e) { return; }
+      this.lastMsg = Date.now();
+      if (m.error) { this.stats.error = String(m.error); return; }
+      if (m.MessageType === 'SubscriptionConfirmation') { this.stats.confirmed = true; return; }
+      this.stats.received++; this.stats.types[m.MessageType] = (this.stats.types[m.MessageType] || 0) + 1;
+      absorb(this.memo, m);
+    });
+    ws.addEventListener('close', ev => { if (this.ws === ws) { this.ws = null; this.stats.closeInfo = { code: ev.code, reason: ev.reason }; } });
+    ws.addEventListener('error', () => { if (this.ws === ws) this.ws = null; });
+    this.ws = ws;
+  }
+  async alarm() {
+    const now = Date.now();
+    if (now - this.lastReq > HUB_IDLE_MS) { try { this.ws && this.ws.close(1000, 'inactif'); } catch (e) {} this.ws = null; this.memo.clear(); return; }
+    // connexion tombee, ou muette depuis trop longtemps (accuse jamais recu / flux gele) : on la refait
+    if (this.ws && (!this.stats.confirmed || now - this.lastMsg > HUB_STALE_MS) && now - this.stats.since > 30000) { try { this.ws.close(1000, 'reconnexion'); } catch (e) {} this.ws = null; }
+    if (!this.ws) await this.connect();
+    try { await this.state.storage.setAlarm(Date.now() + HUB_TICK_MS); } catch (e) {}
+  }
+}
+async function hubShips(env, b) { // -> reponse du hub, ou null pour retomber sur l'ecoute courte
+  if (!env.AIS_HUB) return null;
+  try {
+    const s = hubBox(b), p = new URLSearchParams({ lamin: b.lamin, lomin: b.lomin, lamax: b.lamax, lomax: b.lomax, slamin: s.lamin, slomin: s.lomin, slamax: s.lamax, slomax: s.lomax });
+    const r = await env.AIS_HUB.get(env.AIS_HUB.idFromName([s.lamin, s.lomin, s.lamax, s.lomax].join(','))).fetch('https://hub/?' + p);
+    const j = await r.json();
+    return j.fallback ? null : j;
+  } catch (e) { return null; }
+}
+
 // ---------------- navires : ecoute breve d'AISStream ----------------
 async function ships(env, b, json, listenReq) {
   if (!env.AIS_KEY) return json({ error: 'cle AISStream absente du relais (secret AIS_KEY)' }, 503);
+
+  // ecoute continue (Durable Object) si disponible ; sinon, ou si ?listen= (diagnostic), ecoute courte ci-dessous
+  if (!(listenReq > 0)) { const h = await hubShips(env, b); if (h) return json(h); }
 
   const cellKey = [b.lamin, b.lomin, b.lamax, b.lomax].map(v => v.toFixed(1)).join(',');
   let memo = shipMemo.get(cellKey);

@@ -4,5 +4,21 @@
   "compatibility_date": "2026-09-26",
   "vars": {
     "ALLOWED_ORIGIN": "https://rousseauromain-art.github.io"
-  }
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "AIS_HUB",
+        "class_name": "AisHub"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "AisHub"
+      ]
+    }
+  ]
 }
