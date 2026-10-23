@@ -938,8 +938,9 @@ async function checkAis(env) {
     const out = await new Promise(resolve => {
       const done = v => { clearTimeout(t); resolve(v); };
       const t = setTimeout(() => done('ECHEC (aucun accuse de reception SubscriptionConfirmation en 6 s : flux AISStream muet, voir /ais-debug)'), 6000);
-      ws.addEventListener('message', ev => {
-        try { const m = JSON.parse(typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data));
+      try { ws.binaryType = 'arraybuffer'; } catch (e) {}
+      ws.addEventListener('message', async ev => {
+        try { const m = JSON.parse(await frameText(ev.data));
           if (m.error) done('echec (cle refusee : ' + m.error + ')');
           else if (m.MessageType === 'SubscriptionConfirmation') done('ok (abonnement confirme par AISStream' + (m.Message && m.Message.CompressionEnabled ? ', compression active' : ', sans compression') + ')');
           else done('ok (donnees AIS recues)');
@@ -1022,6 +1023,17 @@ async function planes(env, b, json) {
 }
 
 
+
+// Trame WebSocket -> texte. AISStream envoie des trames BINAIRES (JSON en UTF-8). Cote Workers, selon la date de
+// compatibilite, ev.data est un Blob (binaryType standard) et non un ArrayBuffer : TextDecoder.decode(Blob) leve une
+// exception, que l'ancien code avalait en silence -> "0 message" alors que des trames arrivaient (retour terrain
+// du 23/10/2026 : 28 trames en 8 s sur la Manche, toutes "illisibles").
+async function frameText(d) {
+  if (typeof d === 'string') return d;
+  if (d && typeof d.text === 'function') return await d.text();          // Blob
+  return new TextDecoder().decode(d);                                     // ArrayBuffer / vue typee
+}
+
 const maskKey = sub => ({ ...sub, APIKey: sub.APIKey ? sub.APIKey.slice(0, 4) + '…(' + sub.APIKey.length + ' car.)' : '(absente)' });
 
 // ---------------- /ais-debug : chronologie complete d'une session AISStream ----------------
@@ -1050,10 +1062,11 @@ async function aisDebug(env, b, url, json) {
   const dec = new TextDecoder();
   await new Promise(resolve => {
     const done = () => { clearTimeout(timer); resolve(); }, timer = setTimeout(done, listenMs);
-    ws.addEventListener('message', e => {
-      out.frames++;
+    try { ws.binaryType = 'arraybuffer'; } catch (e) {}
+    ws.addEventListener('message', async e => {
+      out.frames++; out.dataType = out.dataType || Object.prototype.toString.call(e.data);
       const bin = typeof e.data !== 'string'; if (bin) out.binaryFrames++;
-      let txt; try { txt = bin ? dec.decode(e.data) : e.data; } catch (x) { ev('trame-illisible', { octets: e.data && e.data.byteLength }); return; }
+      let txt; try { txt = await frameText(e.data); } catch (x) { ev('trame-illisible', { type: Object.prototype.toString.call(e.data), msg: String(x && x.message || x) }); return; }
       let m; try { m = JSON.parse(txt); } catch (x) { ev('trame-pas-json', { octets: txt.length, debut: txt.slice(0, 120) }); return; }
       if (m.error) { out.error = String(m.error); ev('erreur-amont', { msg: out.error }); done(); return; }
       if (m.MessageType === 'SubscriptionConfirmation') { out.confirmed = true; out.compression = m.Message && m.Message.CompressionEnabled; ev('confirmation', { message: m.Message || m }); return; }
@@ -1068,6 +1081,7 @@ async function aisDebug(env, b, url, json) {
   out.listenMs = Date.now() - t0;
   out.verdict = out.error ? 'AISStream a renvoye une erreur : ' + out.error
     : out.aisMessages > 0 ? `OK : ${out.aisMessages} messages AIS recus (${Object.keys(out.types).join(', ')})`
+    : out.frames > 0 && !out.confirmed ? `${out.frames} trames recues mais illisibles (type ${out.dataType}) : probleme de decodage cote relais`
     : out.closed ? `connexion fermee par AISStream (code ${out.closed.code}${out.closed.reason ? ', ' + out.closed.reason : ''}) sans donnees`
     : out.confirmed ? 'abonnement confirme mais aucun message AIS : zone calme ou flux AISStream vide'
     : 'AUCUN accuse de reception ni message : AISStream n\'a pas valide l\'abonnement (flux muet cote service, cf. github.com/aisstream/aisstream/issues/15)';
@@ -1085,7 +1099,7 @@ async function ships(env, b, json, listenReq) {
   // ?listen=<ms> (diagnostic) : ecoute plus longue, 25 s au plus. Les navires au port/au mouillage n'emettent qu'une
   // position toutes les ~3 min : 10 s n'en attrape qu'une petite fraction (Route du Rhum, Saint-Malo).
   const listenMs = listenReq > 0 ? Math.min(25000, listenReq) : +cfg(env, 'AIS_LISTEN_MS');
-  let upstreamError = null, received = 0, confirmed = false, closeInfo = null; const types = {};
+  let upstreamError = null, received = 0, undecoded = 0, confirmed = false, closeInfo = null; const types = {};
   const t0 = Date.now();
 
   const resp = await fetch(cfg(env, 'AIS_URL'), { headers: { Upgrade: 'websocket' } });
@@ -1104,9 +1118,10 @@ async function ships(env, b, json, listenReq) {
     const done = () => { clearTimeout(timer); resolve(); };
     const timer = setTimeout(done, listenMs);
     const dec = new TextDecoder();
-    ws.addEventListener('message', ev => {
+    try { ws.binaryType = 'arraybuffer'; } catch (e) {}
+    ws.addEventListener('message', async ev => {
       let m;
-      try { m = JSON.parse(typeof ev.data === 'string' ? ev.data : dec.decode(ev.data)); } catch (e) { return; }
+      try { m = JSON.parse(await frameText(ev.data)); } catch (e) { undecoded++; return; }
       if (m.error) { upstreamError = String(m.error); done(); return; }
       if (m.MessageType === 'SubscriptionConfirmation') { confirmed = true; return; }
       received++; types[m.MessageType] = (types[m.MessageType] || 0) + 1;
@@ -1124,7 +1139,7 @@ async function ships(env, b, json, listenReq) {
     if (v.lat == null) continue;
     list.push({ mmsi, ...v });
   }
-  return json({ ships: list, received, types, confirmed, closeInfo, sent: maskKey(sub), listenMs: now - t0, error: upstreamError });
+  return json({ ships: list, received, undecoded, types, confirmed, closeInfo, sent: maskKey(sub), listenMs: now - t0, error: upstreamError });
 }
 
 function absorb(memo, m) {
